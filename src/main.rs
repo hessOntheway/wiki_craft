@@ -1,0 +1,116 @@
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use wiki_craft::config::DEFAULT_CONFIG_PATH;
+use wiki_craft::knowledge::initialize_project;
+use wiki_craft::runtime;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "wiki_craft",
+    version,
+    about = "Markdown-first knowledge base maintenance agent"
+)]
+struct Cli {
+    #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Init,
+    Ingest {
+        #[arg(long)]
+        once: bool,
+    },
+    Serve,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Metrics {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        prometheus: bool,
+    },
+    Candidates {
+        #[command(subcommand)]
+        command: CandidateCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CandidateCommand {
+    List,
+    Diff { run_id: String },
+    Approve { run_id: String },
+}
+
+fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Init => {
+            let report = initialize_project(&cli.config)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Ingest { once: _ } => {
+            let outcome = runtime::run_production_ingest(&cli.config)?;
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+        }
+        Command::Serve => {
+            runtime::serve(&cli.config)?;
+        }
+        Command::Status { json } => {
+            let status = runtime::status(&cli.config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("Wiki Craft status");
+                println!("pending_candidates: {}", status.pending_candidates);
+                println!("compaction_count: {}", status.compaction_count);
+                println!("{}", status.prompt_cache_stats.summary_line());
+                if let Some(run) = status.last_run {
+                    println!("last_run: {:?} - {}", run.kind, run.message);
+                    if let Some(run_id) = run.run_id {
+                        println!("last_candidate: {run_id}");
+                    }
+                } else {
+                    println!("last_run: none");
+                }
+            }
+        }
+        Command::Metrics { json, prometheus } => {
+            if prometheus {
+                print!("{}", runtime::metrics_prometheus(&cli.config)?);
+            } else {
+                let snapshot = runtime::metrics_snapshot(&cli.config)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                }
+            }
+        }
+        Command::Candidates { command } => match command {
+            CandidateCommand::List => {
+                let candidates = runtime::list(&cli.config)?;
+                println!("{}", serde_json::to_string_pretty(&candidates)?);
+            }
+            CandidateCommand::Diff { run_id } => {
+                println!("{}", runtime::candidate_diff(&cli.config, &run_id)?);
+            }
+            CandidateCommand::Approve { run_id } => {
+                runtime::approve(&cli.config, &run_id)?;
+                println!("approved {run_id}");
+            }
+        },
+    }
+
+    Ok(())
+}
