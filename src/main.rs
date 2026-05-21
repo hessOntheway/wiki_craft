@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use wiki_craft::config::DEFAULT_CONFIG_PATH;
 use wiki_craft::knowledge::initialize_project;
 use wiki_craft::runtime;
+use wiki_craft::search::{SearchOptions, render_text_response, search_configured};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,6 +29,14 @@ enum Command {
     },
     Serve,
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
         #[arg(long)]
         json: bool,
     },
@@ -83,6 +92,14 @@ fn main() -> Result<()> {
                 } else {
                     println!("last_run: none");
                 }
+            }
+        }
+        Command::Search { query, top_k, json } => {
+            let response = search_configured(&cli.config, SearchOptions { query, top_k })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("{}", render_text_response(&response));
             }
         }
         Command::Metrics { json, prometheus } => {

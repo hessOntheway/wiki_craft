@@ -5,8 +5,8 @@
 
 [[sources]]
 name = "example"
-url = "https://example.com"
-enabled = false
+url = "https://mp.weixin.qq.com/s/uTPxCmrG0S72Np8EQcmLyA"
+enabled = true
 timeout_seconds = 15
 max_bytes = 200000
 

@@ -6,5 +6,6 @@ pub mod knowledge;
 pub mod llm;
 pub mod metrics;
 pub mod runtime;
+pub mod search;
 pub mod sources;
 pub mod tools;

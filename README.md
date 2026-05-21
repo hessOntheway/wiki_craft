@@ -19,6 +19,7 @@ cargo run -- ingest --once
 cargo run -- candidates list
 cargo run -- candidates diff <run_id>
 cargo run -- candidates approve <run_id>
+cargo run -- search --query "what changed?" --top-k 5 --json
 cargo run -- status
 cargo run -- metrics --prometheus
 ```
@@ -47,6 +48,18 @@ When metrics are enabled, it also exposes:
 - `.wiki_craft/audit/events.jsonl`: lightweight LLM/tool/compaction audit trail.
 - `.wiki_craft/metrics/latest.json`: latest structured metrics snapshot.
 - `.wiki_craft/metrics/events.jsonl`: append-only metrics snapshots for later analysis.
+
+## Codex Retrieval
+
+Codex and other coding agents can call the read-only retrieval surface:
+
+```bash
+cargo run -- search --query "<question>" --top-k 5 --json
+```
+
+`search` reads only `WIKI_CRAFT.md`, `.wiki_craft/knowledge/current/`, and
+`.wiki_craft/source_summaries/current/`. It does not treat staged candidates as
+authoritative knowledge.
 
 ## Architecture
 

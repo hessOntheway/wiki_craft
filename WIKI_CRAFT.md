@@ -23,4 +23,10 @@ Candidate updates under `.wiki_craft/candidates/{run_id}/` are not authoritative
 
 ## v1 Retrieval Surface
 
-Claude Code, Codex, and similar tools should read this file first, then read `.wiki_craft/knowledge/current/Home.md` when it exists.
+Codex and similar tools should call:
+
+```bash
+cargo run -- search --query "<question>" --top-k 5 --json
+```
+
+The search command is read-only and returns approved Markdown snippets with paths, line numbers, source URLs, and version hashes when available.
