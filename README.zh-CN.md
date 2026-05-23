@@ -378,7 +378,7 @@ cargo run -- candidates approve <run_id>
 
 因为批准会整体替换目录，所以每个 candidate 必须是完整的。这也是为什么 ingest 会复制未变化的 source summaries，并要求 LLM 返回完整候选 vault，而不是局部 patch。
 
-批准后，candidate metadata 的状态会变为 `approved`，manifest 中的 summary path 也会更新到正式 source-summary 位置。
+批准后，manifest 中的 summary path 会更新到正式 source-summary 位置，已批准的 candidate 目录会从 staging 中删除。
 
 ## 重组已有知识
 

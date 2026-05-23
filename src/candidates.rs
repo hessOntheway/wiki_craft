@@ -190,6 +190,20 @@ pub fn approve_candidate(paths: &WorkspacePaths, run_id: &str) -> Result<()> {
     write_candidate_metadata(&candidate_paths, &metadata)
 }
 
+pub fn remove_candidate(paths: &WorkspacePaths, run_id: &str) -> Result<()> {
+    validate_run_id(run_id)?;
+    let candidate_paths = CandidatePaths::new(paths, run_id);
+    if !candidate_paths.root.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(&candidate_paths.root).with_context(|| {
+        format!(
+            "failed to remove candidate dir: {}",
+            candidate_paths.root.display()
+        )
+    })
+}
+
 pub fn candidate_metadata(
     run_id: String,
     changed_sources: Vec<ChangedSource>,
@@ -339,6 +353,7 @@ mod tests {
         let current =
             fs::read_to_string(paths.knowledge_current.join("Home.md")).expect("current home");
         assert_eq!(current, "# Candidate\n");
+        assert!(candidate.root.exists());
         let _ = fs::remove_dir_all(root);
     }
 }

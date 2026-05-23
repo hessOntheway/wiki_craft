@@ -378,7 +378,7 @@ Approval promotes:
 
 Because approval replaces directories, every candidate must be complete. This is why ingest copies unchanged source summaries into the candidate and asks the LLM for a complete candidate vault rather than a patch.
 
-After approval, the candidate metadata status becomes `approved`, and manifest summary paths are updated to point at the approved source-summary location.
+After approval, manifest summary paths are updated to point at the approved source-summary location, and the approved candidate directory is removed from staging.
 
 ## Reorganizing Existing Knowledge
 

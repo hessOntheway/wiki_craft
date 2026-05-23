@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 
 use crate::candidates::{
     CandidatePaths, approve_candidate, candidate_metadata, copy_dir, list_candidates,
-    load_candidate_metadata, new_run_id, read_diff, write_candidate_metadata, write_diff,
+    load_candidate_metadata, new_run_id, read_diff, remove_candidate, write_candidate_metadata,
+    write_diff,
 };
 use crate::config::AppConfig;
 use crate::config::SourceConfig;
@@ -803,7 +804,8 @@ pub fn approve(config_path: &Path, run_id: &str) -> Result<()> {
         }
     }
     manifest.save(&paths.manifest_path)?;
-    write_status(&paths, None, GenerationTelemetry::default())
+    write_status(&paths, None, GenerationTelemetry::default())?;
+    remove_candidate(&paths, run_id)
 }
 
 pub fn list(config_path: &Path) -> Result<Vec<crate::candidates::CandidateMetadata>> {
@@ -1106,6 +1108,54 @@ mod tests {
         let candidate = CandidatePaths::new(&paths, &run_id);
 
         assert!(candidate.source_summaries.join("existing.md").exists());
+    }
+
+    #[test]
+    fn approve_removes_candidate_dir_after_success() {
+        let root = unique_temp_dir("wiki-craft-runtime-approve-test");
+        fs::create_dir_all(&root).expect("test root");
+        let workspace_root = root.join(".wiki_craft");
+        let config_path = root.join("wiki_craft.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[runtime]\nroot = \"{}\"\nmax_steps = 4\n",
+                workspace_root.display()
+            ),
+        )
+        .expect("config");
+
+        let cfg = AppConfig {
+            runtime: crate::config::RuntimeConfig {
+                root: workspace_root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        let run_id = "run_runtime_approve_test";
+        let candidate = CandidatePaths::new(&paths, run_id);
+        candidate.ensure().expect("candidate dirs");
+        fs::write(candidate.knowledge.join("index.md"), "# Approved\n").expect("candidate index");
+        fs::write(candidate.source_summaries.join("source.md"), "# Summary\n")
+            .expect("candidate summary");
+        let metadata = candidate_metadata(
+            run_id.to_string(),
+            Vec::new(),
+            PromptCacheStats::default(),
+            0,
+        );
+        write_candidate_metadata(&candidate, &metadata).expect("metadata");
+
+        approve(&config_path, run_id).expect("approve");
+
+        assert_eq!(
+            fs::read_to_string(paths.knowledge_current.join("index.md")).expect("approved index"),
+            "# Approved\n"
+        );
+        assert!(!candidate.root.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 [ingest.once]
 
 [[ingest.once.sources]]
-url = "https://gitcode.csdn.net/6a05afc310ee7a33f272901f.html"
+url = "https://example.com/source.html"
 enabled = true
 timeout_seconds = 15
 max_bytes = 200000
@@ -13,7 +13,7 @@ max_bytes = 200000
 [ingest.cron]
 
 [[ingest.cron.sources]]
-url = "https://gitcode.csdn.net/6a05afc310ee7a33f272901f.html"
+url = "https://example.com/source.html"
 enabled = false
 interval_hours = 24
 timeout_seconds = 15
