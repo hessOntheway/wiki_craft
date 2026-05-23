@@ -1,3 +1,5 @@
 /target
 .wiki_craft/
 .agents/
+wiki_craft.ingest.toml
+wiki_craft.toml

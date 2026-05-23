@@ -5,7 +5,7 @@
 
 [llm]
 base_url = ""
-model = "deepseek-v4-flash"
+model = ""
 max_tokens = 4096
 
 [audit]

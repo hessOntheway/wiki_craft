@@ -65,6 +65,15 @@ Wiki Craft 故意保持存储模型简单：没有向量数据库，没有 embed
 cargo run -- init
 ```
 
+先从 example 模板生成本地配置文件：
+
+```bash
+cp wiki_craft_example.toml wiki_craft.toml
+cp wiki_craft.ingest_example.toml wiki_craft.ingest.toml
+```
+
+然后根据自己的 LLM 和来源配置修改 `wiki_craft.toml` 和 `wiki_craft.ingest.toml`。
+
 编辑 `wiki_craft.ingest.toml`，启用至少一个来源，并配置这三个环境变量：
 
 ```bash

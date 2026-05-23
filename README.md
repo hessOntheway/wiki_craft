@@ -65,6 +65,16 @@ Important directories:
 cargo run -- init
 ```
 
+Create local config files from the example templates:
+
+```bash
+cp wiki_craft_example.toml wiki_craft.toml
+cp wiki_craft.ingest_example.toml wiki_craft.ingest.toml
+```
+
+Then edit `wiki_craft.toml` and `wiki_craft.ingest.toml` for your own LLM and
+source settings.
+
 Edit `wiki_craft.ingest.toml`, enable at least one source, and configure these three environment variables:
 
 ```bash
