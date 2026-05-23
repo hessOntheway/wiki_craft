@@ -2,12 +2,12 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-Wiki Craft is a Markdown-first knowledge-base maintenance agent. It fetches configured URL sources, detects changes, summarizes evidence with an LLM, stages a candidate Obsidian-style vault, and waits for human approval before replacing approved knowledge.
+Wiki Craft is a Markdown-first knowledge-base maintenance agent. It fetches configured URL sources, detects changes, summarizes evidence with an LLM, stages source-summary candidates, and waits for human approval before proposing and merging approved knowledge changes.
 
 The project has two core systems:
 
 - **Search**: a local, read-only retrieval layer over approved Markdown knowledge.
-- **Ingest and indexing**: a maintenance pipeline that fetches sources, summarizes changed evidence, builds topic-first candidate pages, and records provenance.
+- **Ingest and indexing**: a maintenance pipeline that fetches sources, summarizes changed evidence, proposes topic-first candidate pages after summary approval, and records provenance.
 
 Wiki Craft intentionally keeps the storage model simple: no vector database, no embedding pipeline, no raw-source archive. The approved Markdown vault is the retrieval surface. Source summaries are the evidence layer. Candidate updates are staged, diffed, and approved before becoming authoritative.
 
@@ -28,6 +28,11 @@ Wiki Craft intentionally keeps the storage model simple: no vector database, no 
     staging/
       candidates/
         {run_id}/
+          baseline/
+            knowledge/
+              index.md
+              topics/
+                *.md
           knowledge/
             index.md
             topics/
@@ -51,7 +56,7 @@ Important directories:
 - `.wiki_craft/knowledge/approved/topics/*.md`: approved topic-first knowledge pages.
 - `.wiki_craft/knowledge/approved/evidence/sources/manifest.json`: source registry with URLs, content hashes, fetch timestamps, latest candidate run IDs, and summary paths.
 - `.wiki_craft/knowledge/approved/evidence/source_summaries/*.md`: approved LLM-written summaries for source versions.
-- `.wiki_craft/knowledge/staging/candidates/{run_id}/`: complete candidate knowledge and source summaries waiting for review.
+- `.wiki_craft/knowledge/staging/candidates/{run_id}/`: staged source summaries, optional proposed knowledge, baseline snapshots, diffs, and metadata waiting for review.
 - `.wiki_craft/runtime/`: operational state such as sessions, prompt cache, audit events, metrics, transcripts, and status.
 
 ## Quick Start
@@ -73,8 +78,10 @@ Typical workflow:
 ```bash
 cargo run -- ingest --once
 cargo run -- candidates list
+cargo run -- candidates summaries <run_id>
+cargo run -- candidates approve <run_id> # generate knowledge diff
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id>
+cargo run -- candidates approve <run_id> # merge accepted diff
 cargo run -- search --query "what changed?" --top-k 5 --json
 cargo run -- status
 ```
@@ -299,11 +306,11 @@ The generated summary is written to:
 .wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/{source_id}.md
 ```
 
-Before changed summaries are generated, ingest copies current approved source summaries into the candidate. Approval replaces the whole approved source-summary directory, so unchanged summaries must be present in the candidate too.
+Ingest writes only the changed source summaries into the candidate. Final approval merges those changed summaries into the approved source-summary directory, preserving already approved summaries that were not part of the candidate.
 
 ### Candidate Knowledge
 
-After source summaries are ready, Wiki Craft reads the current approved knowledge and asks the LLM to produce a complete candidate vault.
+After source summaries are ready, the first `candidates approve <run_id>` approves those summaries for use in the knowledge proposal. Wiki Craft then snapshots the current approved knowledge under `baseline/knowledge/`, reads the approved knowledge plus changed source summaries, and asks the LLM to produce a complete proposed candidate vault.
 
 The LLM must return JSON:
 
@@ -354,29 +361,41 @@ The candidate is topic-first, not source-first. A source summary may describe on
 
 ### Diff And Metadata
 
-Once candidate files are written, Wiki Craft creates:
+When the first approval writes proposed knowledge files, Wiki Craft creates:
 
-- `diff.md`: a simple line-oriented diff between approved knowledge and candidate knowledge.
+- `baseline/knowledge/`: the approved topic/index snapshot used as the old side of the diff.
+- `knowledge/`: the proposed topic/index vault.
+- `diff.md`: a simple line-oriented diff between the baseline and proposed knowledge.
 - `metadata.json`: run ID, creation time, candidate status, changed sources, prompt cache stats, and compaction count.
 
 The ingest outcome is recorded in `.wiki_craft/runtime/status.json`, and metrics are updated.
 
 ## Approval Model
 
-Candidates are not authoritative. Approval is explicit:
+Candidates are not authoritative. Approval is explicit and two-step:
 
 ```bash
 cargo run -- candidates list
+cargo run -- candidates summaries <run_id>
+cargo run -- candidates approve <run_id> # summaries_staged -> diff_ready
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id>
+cargo run -- candidates approve <run_id> # diff_ready -> approved
 ```
 
-Approval promotes:
+The first approval does not modify approved knowledge or approved source summaries. It only generates `baseline/knowledge/`, proposed `knowledge/`, and `diff.md`.
+
+The second approval promotes:
 
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/knowledge/` to `.wiki_craft/knowledge/approved/`
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` to `.wiki_craft/knowledge/approved/evidence/source_summaries/`
 
-Because approval replaces directories, every candidate must be complete. This is why ingest copies unchanged source summaries into the candidate and asks the LLM for a complete candidate vault rather than a patch.
+Rejecting a candidate is also explicit:
+
+```bash
+cargo run -- candidates reject <run_id>
+```
+
+Because final approval replaces the approved topic/index vault, every proposed knowledge vault must be complete. Source summaries are merged by file, so staging only needs to contain the changed summaries for that run.
 
 After approval, manifest summary paths are updated to point at the approved source-summary location, and the approved candidate directory is removed from staging.
 
@@ -388,7 +407,7 @@ Use this command to convert existing approved Markdown into a candidate topic-fi
 cargo run -- knowledge reorganize
 ```
 
-This command reads `.wiki_craft/knowledge/approved/`, splits existing Markdown conservatively by headings, creates candidate `index.md` and `topics/*.md`, copies current source summaries into the candidate, writes `diff.md` and `metadata.json`, and leaves approved knowledge unchanged.
+This command reads `.wiki_craft/knowledge/approved/`, splits existing Markdown conservatively by headings, creates candidate `index.md` and `topics/*.md`, writes `diff.md` and `metadata.json`, and leaves approved knowledge unchanged.
 
 Review and approve it like any ingest candidate.
 

@@ -4,7 +4,7 @@
 # LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
 
 [llm]
-base_url = "https://api.deepseek.com"
+base_url = ""
 model = "deepseek-v4-flash"
 max_tokens = 4096
 

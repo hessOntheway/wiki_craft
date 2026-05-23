@@ -60,7 +60,9 @@ enum Command {
 enum CandidateCommand {
     List,
     Diff { run_id: String },
+    Summaries { run_id: String },
     Approve { run_id: String },
+    Reject { run_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,9 +133,16 @@ fn main() -> Result<()> {
             CandidateCommand::Diff { run_id } => {
                 println!("{}", runtime::candidate_diff(&cli.config, &run_id)?);
             }
+            CandidateCommand::Summaries { run_id } => {
+                println!("{}", runtime::candidate_summaries(&cli.config, &run_id)?);
+            }
             CandidateCommand::Approve { run_id } => {
-                runtime::approve(&cli.config, &run_id)?;
-                println!("approved {run_id}");
+                let outcome = runtime::approve(&cli.config, &run_id)?;
+                println!("{}", outcome.message);
+            }
+            CandidateCommand::Reject { run_id } => {
+                runtime::reject(&cli.config, &run_id)?;
+                println!("rejected {run_id}");
             }
         },
         Command::Knowledge { command } => match command {

@@ -28,7 +28,9 @@ pub struct CandidateMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateStatus {
-    Staged,
+    #[serde(alias = "staged")]
+    SummariesStaged,
+    DiffReady,
     Approved,
 }
 
@@ -36,6 +38,7 @@ pub enum CandidateStatus {
 pub struct CandidatePaths {
     pub root: PathBuf,
     pub source_summaries: PathBuf,
+    pub baseline_knowledge: PathBuf,
     pub knowledge: PathBuf,
     pub diff: PathBuf,
     pub metadata: PathBuf,
@@ -46,6 +49,7 @@ impl CandidatePaths {
         let root = paths.candidates_dir.join(run_id);
         Self {
             source_summaries: root.join("evidence").join("source_summaries"),
+            baseline_knowledge: root.join("baseline").join("knowledge"),
             knowledge: root.join("knowledge"),
             diff: root.join("diff.md"),
             metadata: root.join("metadata.json"),
@@ -54,7 +58,7 @@ impl CandidatePaths {
     }
 
     pub fn ensure(&self) -> Result<()> {
-        for dir in [&self.root, &self.source_summaries, &self.knowledge] {
+        for dir in [&self.root, &self.source_summaries] {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create candidate dir: {}", dir.display()))?;
         }
@@ -159,9 +163,17 @@ pub fn write_diff(paths: &CandidatePaths, current_dir: &Path) -> Result<String> 
     Ok(diff)
 }
 
+pub fn write_baseline_diff(paths: &CandidatePaths) -> Result<String> {
+    write_diff(paths, &paths.baseline_knowledge)
+}
+
 pub fn read_diff(paths: &WorkspacePaths, run_id: &str) -> Result<String> {
     validate_run_id(run_id)?;
     let candidate = CandidatePaths::new(paths, run_id);
+    let metadata = load_candidate_metadata(paths, run_id)?;
+    if metadata.status != CandidateStatus::DiffReady {
+        bail!("candidate {run_id} has no knowledge diff yet; approve staged summaries first");
+    }
     fs::read_to_string(&candidate.diff).with_context(|| {
         format!(
             "failed to read candidate diff: {}",
@@ -170,8 +182,52 @@ pub fn read_diff(paths: &WorkspacePaths, run_id: &str) -> Result<String> {
     })
 }
 
+pub fn read_changed_source_summaries(paths: &WorkspacePaths, run_id: &str) -> Result<String> {
+    validate_run_id(run_id)?;
+    let metadata = load_candidate_metadata(paths, run_id)?;
+    let candidate = CandidatePaths::new(paths, run_id);
+    let mut sections = vec![format!(
+        "# Wiki Craft Candidate Source Summaries\n\nRun: `{run_id}`"
+    )];
+    for changed in metadata.changed_sources {
+        let summary_path = candidate
+            .source_summaries
+            .join(format!("{}.md", changed.source_id));
+        let summary = fs::read_to_string(&summary_path).with_context(|| {
+            format!("failed to read source summary: {}", summary_path.display())
+        })?;
+        sections.push(format!(
+            "## Source `{}`\n\nURL: {}\nHash: {}\n\n{}",
+            changed.source_id, changed.url, changed.new_hash, summary
+        ));
+    }
+    if sections.len() == 1 {
+        sections.push("No changed source summaries.".to_string());
+    }
+    Ok(sections.join("\n\n"))
+}
+
+pub fn mark_diff_ready(
+    paths: &WorkspacePaths,
+    run_id: &str,
+    telemetry: PromptCacheStats,
+    compaction_count: u64,
+) -> Result<()> {
+    validate_run_id(run_id)?;
+    let candidate_paths = CandidatePaths::new(paths, run_id);
+    let mut metadata = load_candidate_metadata(paths, run_id)?;
+    metadata.status = CandidateStatus::DiffReady;
+    metadata.prompt_cache_stats.merge(&telemetry);
+    metadata.compaction_count += compaction_count;
+    write_candidate_metadata(&candidate_paths, &metadata)
+}
+
 pub fn approve_candidate(paths: &WorkspacePaths, run_id: &str) -> Result<()> {
     validate_run_id(run_id)?;
+    let metadata = load_candidate_metadata(paths, run_id)?;
+    if metadata.status != CandidateStatus::DiffReady {
+        bail!("candidate {run_id} is not ready to merge; approve staged summaries first");
+    }
     let candidate_paths = CandidatePaths::new(paths, run_id);
     if !candidate_paths.knowledge.exists() {
         bail!(
@@ -179,8 +235,8 @@ pub fn approve_candidate(paths: &WorkspacePaths, run_id: &str) -> Result<()> {
             candidate_paths.knowledge.display()
         );
     }
-    replace_dir(&candidate_paths.knowledge, &paths.knowledge_current)?;
-    replace_dir(
+    replace_knowledge_vault(&candidate_paths.knowledge, &paths.knowledge_current)?;
+    copy_dir(
         &candidate_paths.source_summaries,
         &paths.source_summaries_current,
     )?;
@@ -214,7 +270,7 @@ pub fn candidate_metadata(
         schema_version: CANDIDATE_SCHEMA_VERSION,
         run_id,
         created_at_unix_ms: now_unix_ms(),
-        status: CandidateStatus::Staged,
+        status: CandidateStatus::SummariesStaged,
         changed_sources,
         prompt_cache_stats,
         compaction_count,
@@ -261,19 +317,23 @@ fn render_simple_diff(current: &str, candidate: &str) -> Vec<String> {
     out
 }
 
-fn replace_dir(from: &Path, to: &Path) -> Result<()> {
-    let tmp = to.with_extension(format!("tmp_{}", now_unix_ms()));
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp)
-            .with_context(|| format!("failed to clean tmp dir: {}", tmp.display()))?;
+fn replace_knowledge_vault(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to).with_context(|| format!("failed to create dir: {}", to.display()))?;
+    let index_path = to.join("index.md");
+    if index_path.exists() {
+        fs::remove_file(&index_path)
+            .with_context(|| format!("failed to remove existing file: {}", index_path.display()))?;
     }
-    copy_dir(from, &tmp)?;
-    if to.exists() {
-        fs::remove_dir_all(to)
-            .with_context(|| format!("failed to remove existing dir: {}", to.display()))?;
+    let topics_path = to.join("topics");
+    if topics_path.exists() {
+        fs::remove_dir_all(&topics_path).with_context(|| {
+            format!(
+                "failed to remove existing topics dir: {}",
+                topics_path.display()
+            )
+        })?;
     }
-    fs::rename(&tmp, to)
-        .with_context(|| format!("failed to promote {} to {}", tmp.display(), to.display()))
+    copy_dir(from, to)
 }
 
 pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<()> {
@@ -338,14 +398,16 @@ mod tests {
         let run_id = "run_test";
         let candidate = CandidatePaths::new(&paths, run_id);
         candidate.ensure().expect("candidate dirs");
+        fs::create_dir_all(&candidate.knowledge).expect("candidate knowledge dir");
         fs::write(candidate.knowledge.join("Home.md"), "# Candidate\n").expect("home");
         fs::write(candidate.source_summaries.join("source.md"), "# Summary\n").expect("summary");
-        let metadata = candidate_metadata(
+        let mut metadata = candidate_metadata(
             run_id.to_string(),
             Vec::new(),
             PromptCacheStats::default(),
             0,
         );
+        metadata.status = CandidateStatus::DiffReady;
         write_candidate_metadata(&candidate, &metadata).expect("metadata");
 
         approve_candidate(&paths, run_id).expect("approve");

@@ -37,6 +37,10 @@ pub struct SourceRecord {
     pub latest_candidate_run_id: Option<String>,
     #[serde(default)]
     pub summary_path: Option<String>,
+    #[serde(default)]
+    pub pending_content_hash: Option<String>,
+    #[serde(default)]
+    pub pending_summary_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,9 +60,17 @@ pub struct FetchedSource {
 pub struct ChangedSource {
     pub source_id: String,
     pub url: String,
+    #[serde(default)]
+    pub final_url: Option<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
     pub previous_hash: Option<String>,
     pub new_hash: String,
+    #[serde(default)]
+    pub version_key: Option<String>,
     pub summary_path: String,
 }
 
@@ -93,16 +105,16 @@ impl SourceManifest {
     }
 
     pub fn is_changed(&self, fetched: &FetchedSource) -> bool {
-        self.sources
-            .get(&fetched.source_id)
-            .map(|record| record.content_hash != fetched.content_hash)
-            .unwrap_or(true)
+        self.sources.get(&fetched.source_id).map_or(true, |record| {
+            record.content_hash != fetched.content_hash
+                && record.pending_content_hash.as_deref() != Some(fetched.content_hash.as_str())
+        })
     }
 
     pub fn previous_hash(&self, source_id: &str) -> Option<String> {
-        self.sources
-            .get(source_id)
-            .map(|record| record.content_hash.clone())
+        self.sources.get(source_id).and_then(|record| {
+            (!record.content_hash.is_empty()).then(|| record.content_hash.clone())
+        })
     }
 
     pub fn upsert_fetched(
@@ -141,8 +153,113 @@ impl SourceManifest {
                     .or_else(|| previous.and_then(|record| record.latest_candidate_run_id.clone())),
                 summary_path: summary_path
                     .or_else(|| previous.and_then(|record| record.summary_path.clone())),
+                pending_content_hash: previous
+                    .and_then(|record| record.pending_content_hash.clone()),
+                pending_summary_path: previous
+                    .and_then(|record| record.pending_summary_path.clone()),
             },
         );
+    }
+
+    pub fn stage_changed(
+        &mut self,
+        fetched: &FetchedSource,
+        run_id: &str,
+        pending_summary_path: String,
+    ) {
+        let now = now_unix_ms();
+        let previous = self.sources.get(&fetched.source_id);
+        self.sources.insert(
+            fetched.source_id.clone(),
+            SourceRecord {
+                id: fetched.source_id.clone(),
+                url: fetched.url.clone(),
+                final_url: fetched.final_url.clone(),
+                title: fetched.title.clone(),
+                etag: fetched.etag.clone(),
+                last_modified: fetched.last_modified.clone(),
+                content_hash: previous
+                    .map(|record| record.content_hash.clone())
+                    .unwrap_or_default(),
+                version_key: previous
+                    .map(|record| record.version_key.clone())
+                    .unwrap_or_default(),
+                last_fetched_unix_ms: now,
+                last_changed_unix_ms: previous
+                    .map(|record| record.last_changed_unix_ms)
+                    .unwrap_or(now),
+                latest_candidate_run_id: Some(run_id.to_string()),
+                summary_path: previous.and_then(|record| record.summary_path.clone()),
+                pending_content_hash: Some(fetched.content_hash.clone()),
+                pending_summary_path: Some(pending_summary_path),
+            },
+        );
+    }
+
+    pub fn upsert_approved_changed(
+        &mut self,
+        changed: &ChangedSource,
+        run_id: &str,
+        summary_path: String,
+    ) {
+        let now = now_unix_ms();
+        let previous_last_changed = self
+            .sources
+            .get(&changed.source_id)
+            .filter(|record| record.content_hash == changed.new_hash)
+            .map(|record| record.last_changed_unix_ms);
+        self.sources.insert(
+            changed.source_id.clone(),
+            SourceRecord {
+                id: changed.source_id.clone(),
+                url: changed.url.clone(),
+                final_url: changed
+                    .final_url
+                    .clone()
+                    .unwrap_or_else(|| changed.url.clone()),
+                title: changed.title.clone(),
+                etag: changed.etag.clone(),
+                last_modified: changed.last_modified.clone(),
+                content_hash: changed.new_hash.clone(),
+                version_key: changed
+                    .version_key
+                    .clone()
+                    .unwrap_or_else(|| changed.new_hash.clone()),
+                last_fetched_unix_ms: now,
+                last_changed_unix_ms: now,
+                latest_candidate_run_id: Some(run_id.to_string()),
+                summary_path: Some(summary_path),
+                pending_content_hash: None,
+                pending_summary_path: None,
+            },
+        );
+        if let Some(previous_last_changed) = previous_last_changed
+            && let Some(record) = self.sources.get_mut(&changed.source_id)
+        {
+            record.last_changed_unix_ms = previous_last_changed;
+        }
+    }
+
+    pub fn clear_pending_candidate(&mut self, changed: &ChangedSource, run_id: &str) {
+        let should_remove = self
+            .sources
+            .get(&changed.source_id)
+            .map(|record| {
+                record.latest_candidate_run_id.as_deref() == Some(run_id)
+                    && (changed.previous_hash.is_none() || record.content_hash.is_empty())
+            })
+            .unwrap_or(false);
+        if should_remove {
+            self.sources.remove(&changed.source_id);
+            return;
+        }
+        if let Some(record) = self.sources.get_mut(&changed.source_id)
+            && record.latest_candidate_run_id.as_deref() == Some(run_id)
+        {
+            record.latest_candidate_run_id = None;
+            record.pending_content_hash = None;
+            record.pending_summary_path = None;
+        }
     }
 }
 

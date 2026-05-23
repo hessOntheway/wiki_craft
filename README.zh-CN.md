@@ -2,12 +2,12 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-Wiki Craft 是一个以 Markdown 为核心的知识库维护代理。它会抓取配置好的 URL 来源，检测内容变化，用 LLM 生成证据摘要，构建候选 Obsidian 风格知识库，并在人工审核批准后才替换正式知识。
+Wiki Craft 是一个以 Markdown 为核心的知识库维护代理。它会抓取配置好的 URL 来源，检测内容变化，用 LLM 生成证据摘要，先暂存 source summary 候选，并在人工审核后再生成知识 diff、最终合并正式知识。
 
 项目当前有两套核心系统：
 
 - **检索 Search**：在已批准 Markdown 知识库上的本地只读检索层。
-- **抓取与索引构建 Ingest and indexing**：抓取来源、摘要变化证据、构建 topic-first 候选页面并记录来源追溯的维护流水线。
+- **抓取与索引构建 Ingest and indexing**：抓取来源、摘要变化证据，在摘要批准后生成 topic-first 候选页面，并记录来源追溯的维护流水线。
 
 Wiki Craft 故意保持存储模型简单：没有向量数据库，没有 embedding pipeline，也不保存原始来源全文。已批准的 Markdown vault 就是检索面；source summaries 是证据层；候选更新必须先 staged、diff、approve，之后才成为正式知识。
 
@@ -28,6 +28,11 @@ Wiki Craft 故意保持存储模型简单：没有向量数据库，没有 embed
     staging/
       candidates/
         {run_id}/
+          baseline/
+            knowledge/
+              index.md
+              topics/
+                *.md
           knowledge/
             index.md
             topics/
@@ -51,7 +56,7 @@ Wiki Craft 故意保持存储模型简单：没有向量数据库，没有 embed
 - `.wiki_craft/knowledge/approved/topics/*.md`：已批准的 topic-first 知识页面。
 - `.wiki_craft/knowledge/approved/evidence/sources/manifest.json`：来源注册表，保存 URL、内容 hash、抓取时间、最新候选 run ID 和摘要路径。
 - `.wiki_craft/knowledge/approved/evidence/source_summaries/*.md`：已批准的 LLM 来源摘要。
-- `.wiki_craft/knowledge/staging/candidates/{run_id}/`：等待审核的完整候选知识库和来源摘要。
+- `.wiki_craft/knowledge/staging/candidates/{run_id}/`：等待审核的来源摘要、可选知识提案、baseline 快照、diff 和元数据。
 - `.wiki_craft/runtime/`：运行状态，包括 sessions、prompt cache、audit events、metrics、transcripts 和 status。
 
 ## 快速开始
@@ -73,8 +78,10 @@ export LLM_MODEL="..."
 ```bash
 cargo run -- ingest --once
 cargo run -- candidates list
+cargo run -- candidates summaries <run_id>
+cargo run -- candidates approve <run_id> # 生成知识 diff
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id>
+cargo run -- candidates approve <run_id> # 合并已同意的 diff
 cargo run -- search --query "what changed?" --top-k 5 --json
 cargo run -- status
 ```
@@ -299,11 +306,11 @@ source manifest 位于：
 .wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/{source_id}.md
 ```
 
-在生成变化来源的新摘要之前，ingest 会先把当前已批准的 source summaries 复制进候选目录。因为批准时会整体替换 source summary 目录，所以未变化摘要也必须出现在 candidate 中。
+ingest 只会把本次变化来源的新摘要写入候选目录。最终批准会把这些变化摘要按文件合并进正式 source-summary 目录，并保留不属于本次候选的既有正式摘要。
 
 ### 候选知识库
 
-source summaries 准备好后，Wiki Craft 会读取当前正式知识，并让 LLM 生成一个完整候选 vault。
+source summaries 准备好后，第一次 `candidates approve <run_id>` 表示用户同意这些摘要可用于知识库提案。Wiki Craft 随后会把当前正式知识快照保存到 `baseline/knowledge/`，读取正式知识和变化摘要，并让 LLM 生成一个完整候选 vault。
 
 LLM 必须返回 JSON：
 
@@ -354,29 +361,41 @@ Search is the read-only retrieval surface for approved knowledge.
 
 ### Diff 与元数据
 
-候选文件写入后，Wiki Craft 会创建：
+第一次批准写入候选知识文件后，Wiki Craft 会创建：
 
-- `diff.md`：正式知识与候选知识之间的简单逐行 diff。
+- `baseline/knowledge/`：用于 diff 旧侧的正式 topic/index 快照。
+- `knowledge/`：模型生成的候选 topic/index vault。
+- `diff.md`：baseline 与候选知识之间的简单逐行 diff。
 - `metadata.json`：run ID、创建时间、候选状态、变化来源、prompt cache stats 和 compaction count。
 
 ingest 结果会写入 `.wiki_craft/runtime/status.json`，metrics 也会更新。
 
 ## 批准模型
 
-候选内容不是正式知识。批准必须显式执行：
+候选内容不是正式知识。批准分两步显式执行：
 
 ```bash
 cargo run -- candidates list
+cargo run -- candidates summaries <run_id>
+cargo run -- candidates approve <run_id> # summaries_staged -> diff_ready
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id>
+cargo run -- candidates approve <run_id> # diff_ready -> approved
 ```
 
-批准会提升：
+第一次批准不会修改正式知识或正式 source summaries，只会生成 `baseline/knowledge/`、候选 `knowledge/` 和 `diff.md`。
+
+第二次批准会提升：
 
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/knowledge/` 到 `.wiki_craft/knowledge/approved/`
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` 到 `.wiki_craft/knowledge/approved/evidence/source_summaries/`
 
-因为批准会整体替换目录，所以每个 candidate 必须是完整的。这也是为什么 ingest 会复制未变化的 source summaries，并要求 LLM 返回完整候选 vault，而不是局部 patch。
+拒绝候选也需要显式执行：
+
+```bash
+cargo run -- candidates reject <run_id>
+```
+
+因为最终批准会整体替换正式 topic/index vault，所以候选知识 vault 必须是完整的。source summaries 则按文件合并，因此 staging 里只需要保存本次变化的摘要。
 
 批准后，manifest 中的 summary path 会更新到正式 source-summary 位置，已批准的 candidate 目录会从 staging 中删除。
 
@@ -388,7 +407,7 @@ cargo run -- candidates approve <run_id>
 cargo run -- knowledge reorganize
 ```
 
-这个命令会读取 `.wiki_craft/knowledge/approved/`，按标题保守切分已有 Markdown，创建候选 `index.md` 和 `topics/*.md`，复制当前 source summaries，写入 `diff.md` 和 `metadata.json`，但不修改正式知识。
+这个命令会读取 `.wiki_craft/knowledge/approved/`，按标题保守切分已有 Markdown，创建候选 `index.md` 和 `topics/*.md`，写入 `diff.md` 和 `metadata.json`，但不修改正式知识。
 
 它和普通 ingest candidate 一样，需要先 review，再 approve。
 

@@ -5,7 +5,7 @@
 [ingest.once]
 
 [[ingest.once.sources]]
-url = "https://example.com/source.html"
+url = "https://aiedlab.substack.com/p/rag-100"
 enabled = true
 timeout_seconds = 15
 max_bytes = 200000

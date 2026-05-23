@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::candidates::{
-    CandidatePaths, approve_candidate, candidate_metadata, copy_dir, list_candidates,
-    load_candidate_metadata, new_run_id, read_diff, remove_candidate, write_candidate_metadata,
-    write_diff,
+    CandidatePaths, CandidateStatus, approve_candidate, candidate_metadata, copy_dir,
+    list_candidates, load_candidate_metadata, mark_diff_ready, new_run_id,
+    read_changed_source_summaries, read_diff, remove_candidate, write_baseline_diff,
+    write_candidate_metadata,
 };
 use crate::config::AppConfig;
 use crate::config::SourceConfig;
@@ -433,6 +434,13 @@ pub struct ReorganizeOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproveOutcome {
+    pub run_id: String,
+    pub status: CandidateStatus,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub schema_version: u32,
     pub updated_at_unix_ms: u128,
@@ -561,7 +569,6 @@ pub(crate) fn run_ingest_for_sources(
     let run_id = new_run_id();
     let candidate_paths = CandidatePaths::new(paths, &run_id);
     candidate_paths.ensure()?;
-    copy_current_source_summaries(paths, &candidate_paths)?;
 
     let mut changed_summaries = Vec::<(ChangedSource, String)>::new();
     for fetched in &fetched_changed {
@@ -574,19 +581,17 @@ pub(crate) fn run_ingest_for_sources(
         let changed = ChangedSource {
             source_id: fetched.source_id.clone(),
             url: fetched.url.clone(),
+            final_url: Some(fetched.final_url.clone()),
             title: fetched.title.clone(),
+            etag: fetched.etag.clone(),
+            last_modified: fetched.last_modified.clone(),
             previous_hash: manifest.previous_hash(&fetched.source_id),
             new_hash: fetched.content_hash.clone(),
+            version_key: Some(fetched.version_key.clone()),
             summary_path: format!("evidence/source_summaries/{summary_rel}"),
         };
         changed_summaries.push((changed, summary));
     }
-
-    let current_knowledge = read_current_knowledge(paths)?;
-    let vault_files =
-        generator.generate_candidate_knowledge(&changed_summaries, &current_knowledge)?;
-    write_vault_files(&candidate_paths.knowledge, &vault_files)?;
-    write_diff(&candidate_paths, &paths.knowledge_current)?;
 
     let changed_sources = changed_summaries
         .iter()
@@ -602,16 +607,14 @@ pub(crate) fn run_ingest_for_sources(
     write_candidate_metadata(&candidate_paths, &metadata)?;
 
     for (fetched, (changed, _)) in fetched_changed.iter().zip(changed_summaries.iter()) {
-        manifest.upsert_fetched(
+        manifest.stage_changed(
             fetched,
-            Some(&run_id),
-            Some(
-                candidate_paths
-                    .source_summaries
-                    .join(format!("{}.md", changed.source_id))
-                    .display()
-                    .to_string(),
-            ),
+            &run_id,
+            candidate_paths
+                .source_summaries
+                .join(format!("{}.md", changed.source_id))
+                .display()
+                .to_string(),
         );
     }
     manifest.last_run_id = Some(run_id.clone());
@@ -622,7 +625,8 @@ pub(crate) fn run_ingest_for_sources(
         run_id: Some(run_id),
         changed_sources,
         checked_sources: checked,
-        message: "candidate created; review diff before approve".to_string(),
+        message: "candidate source summaries created; approve summaries to generate knowledge diff"
+            .to_string(),
     };
     write_status(paths, Some(outcome.clone()), telemetry)?;
     Ok(outcome)
@@ -636,14 +640,16 @@ pub fn reorganize(config_path: &Path) -> Result<ReorganizeOutcome> {
     let run_id = new_run_id();
     let candidate_paths = CandidatePaths::new(&paths, &run_id);
     candidate_paths.ensure()?;
-    copy_current_source_summaries(&paths, &candidate_paths)?;
+    copy_current_knowledge_to_baseline(&paths, &candidate_paths)?;
 
     let current_knowledge = read_current_knowledge(&paths)?;
     let vault_files = build_reorganized_vault(&current_knowledge, &run_id);
     write_vault_files(&candidate_paths.knowledge, &vault_files)?;
-    write_diff(&candidate_paths, &paths.knowledge_current)?;
+    write_baseline_diff(&candidate_paths)?;
 
-    let metadata = candidate_metadata(run_id.clone(), Vec::new(), PromptCacheStats::default(), 0);
+    let mut metadata =
+        candidate_metadata(run_id.clone(), Vec::new(), PromptCacheStats::default(), 0);
+    metadata.status = CandidateStatus::DiffReady;
     write_candidate_metadata(&candidate_paths, &metadata)?;
 
     Ok(ReorganizeOutcome {
@@ -786,26 +792,95 @@ pub fn candidate_diff(config_path: &Path, run_id: &str) -> Result<String> {
     read_diff(&paths, run_id)
 }
 
-pub fn approve(config_path: &Path, run_id: &str) -> Result<()> {
+pub fn candidate_summaries(config_path: &Path, run_id: &str) -> Result<String> {
     let config = AppConfig::load_or_default(config_path)?;
     let paths = WorkspacePaths::from_config(&config);
-    let metadata = load_candidate_metadata(&paths, run_id)?;
-    approve_candidate(&paths, run_id)?;
+    read_changed_source_summaries(&paths, run_id)
+}
+
+pub fn approve(config_path: &Path, run_id: &str) -> Result<ApproveOutcome> {
+    let config = AppConfig::load_or_default(config_path)?;
+    let paths = WorkspacePaths::from_config(&config);
+    let mut generator = LazyLlmKnowledgeGenerator::new(config, paths.clone());
+    approve_with_generator(&paths, run_id, &mut generator)
+}
+
+pub(crate) fn approve_with_generator(
+    paths: &WorkspacePaths,
+    run_id: &str,
+    generator: &mut dyn KnowledgeGenerator,
+) -> Result<ApproveOutcome> {
+    let metadata = load_candidate_metadata(paths, run_id)?;
+    match metadata.status {
+        CandidateStatus::SummariesStaged => approve_summaries(paths, run_id, generator),
+        CandidateStatus::DiffReady => approve_diff(paths, run_id, metadata),
+        CandidateStatus::Approved => bail!("candidate {run_id} has already been approved"),
+    }
+}
+
+fn approve_summaries(
+    paths: &WorkspacePaths,
+    run_id: &str,
+    generator: &mut dyn KnowledgeGenerator,
+) -> Result<ApproveOutcome> {
+    let candidate_paths = CandidatePaths::new(paths, run_id);
+    copy_current_knowledge_to_baseline(paths, &candidate_paths)?;
+    if candidate_paths.knowledge.exists() {
+        fs::remove_dir_all(&candidate_paths.knowledge).with_context(|| {
+            format!(
+                "failed to remove stale candidate knowledge: {}",
+                candidate_paths.knowledge.display()
+            )
+        })?;
+    }
+
+    let changed_summaries = load_changed_summaries(paths, run_id)?;
+    let current_knowledge = read_current_knowledge(paths)?;
+    let vault_files =
+        generator.generate_candidate_knowledge(&changed_summaries, &current_knowledge)?;
+    write_vault_files(&candidate_paths.knowledge, &vault_files)?;
+    write_baseline_diff(&candidate_paths)?;
+
+    let telemetry = generator.telemetry();
+    mark_diff_ready(
+        paths,
+        run_id,
+        telemetry.prompt_cache_stats.clone(),
+        telemetry.compaction_count,
+    )?;
+    write_status(paths, None, telemetry)?;
+    Ok(ApproveOutcome {
+        run_id: run_id.to_string(),
+        status: CandidateStatus::DiffReady,
+        message:
+            "candidate summaries approved; review generated knowledge diff before final approve"
+                .to_string(),
+    })
+}
+
+fn approve_diff(
+    paths: &WorkspacePaths,
+    run_id: &str,
+    metadata: crate::candidates::CandidateMetadata,
+) -> Result<ApproveOutcome> {
+    approve_candidate(paths, run_id)?;
     let mut manifest = SourceManifest::load(&paths.manifest_path)?;
     for changed in metadata.changed_sources {
-        if let Some(record) = manifest.sources.get_mut(&changed.source_id) {
-            record.summary_path = Some(
-                paths
-                    .source_summaries_current
-                    .join(format!("{}.md", changed.source_id))
-                    .display()
-                    .to_string(),
-            );
-        }
+        let summary_path = paths
+            .source_summaries_current
+            .join(format!("{}.md", changed.source_id))
+            .display()
+            .to_string();
+        manifest.upsert_approved_changed(&changed, run_id, summary_path);
     }
     manifest.save(&paths.manifest_path)?;
     write_status(&paths, None, GenerationTelemetry::default())?;
-    remove_candidate(&paths, run_id)
+    remove_candidate(paths, run_id)?;
+    Ok(ApproveOutcome {
+        run_id: run_id.to_string(),
+        status: CandidateStatus::Approved,
+        message: "candidate knowledge diff approved and merged".to_string(),
+    })
 }
 
 pub fn list(config_path: &Path) -> Result<Vec<crate::candidates::CandidateMetadata>> {
@@ -814,11 +889,55 @@ pub fn list(config_path: &Path) -> Result<Vec<crate::candidates::CandidateMetada
     list_candidates(&paths)
 }
 
-fn copy_current_source_summaries(paths: &WorkspacePaths, candidate: &CandidatePaths) -> Result<()> {
-    if !paths.source_summaries_current.exists() {
-        return Ok(());
+pub fn reject(config_path: &Path, run_id: &str) -> Result<()> {
+    let config = AppConfig::load_or_default(config_path)?;
+    let paths = WorkspacePaths::from_config(&config);
+    let metadata = load_candidate_metadata(&paths, run_id)?;
+    if metadata.status == CandidateStatus::Approved {
+        bail!("candidate {run_id} has already been approved and cannot be rejected");
     }
-    copy_dir(&paths.source_summaries_current, &candidate.source_summaries)
+    let mut manifest = SourceManifest::load(&paths.manifest_path)?;
+    for changed in &metadata.changed_sources {
+        manifest.clear_pending_candidate(changed, run_id);
+    }
+    manifest.save(&paths.manifest_path)?;
+    remove_candidate(&paths, run_id)
+}
+
+fn copy_current_knowledge_to_baseline(
+    paths: &WorkspacePaths,
+    candidate: &CandidatePaths,
+) -> Result<()> {
+    if candidate.baseline_knowledge.exists() {
+        fs::remove_dir_all(&candidate.baseline_knowledge).with_context(|| {
+            format!(
+                "failed to remove stale candidate baseline: {}",
+                candidate.baseline_knowledge.display()
+            )
+        })?;
+    }
+    copy_dir(&paths.knowledge_current, &candidate.baseline_knowledge)
+}
+
+fn load_changed_summaries(
+    paths: &WorkspacePaths,
+    run_id: &str,
+) -> Result<Vec<(ChangedSource, String)>> {
+    let metadata = load_candidate_metadata(paths, run_id)?;
+    let candidate = CandidatePaths::new(paths, run_id);
+    metadata
+        .changed_sources
+        .into_iter()
+        .map(|changed| {
+            let summary_path = candidate
+                .source_summaries
+                .join(format!("{}.md", changed.source_id));
+            let summary = fs::read_to_string(&summary_path).with_context(|| {
+                format!("failed to read source summary: {}", summary_path.display())
+            })?;
+            Ok((changed, summary))
+        })
+        .collect()
 }
 
 fn write_status(
@@ -866,7 +985,13 @@ fn write_status(
 fn pending_candidate_count(paths: &WorkspacePaths) -> Result<usize> {
     Ok(list_candidates(paths)?
         .into_iter()
-        .filter(|metadata| metadata.status == crate::candidates::CandidateStatus::Staged)
+        .filter(|metadata| {
+            matches!(
+                metadata.status,
+                crate::candidates::CandidateStatus::SummariesStaged
+                    | crate::candidates::CandidateStatus::DiffReady
+            )
+        })
         .count())
 }
 
@@ -1069,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_candidate_keeps_existing_source_summaries() {
+    fn ingest_candidate_only_writes_changed_source_summaries() {
         let root = unique_temp_dir("wiki-craft-source-summary-copy-test");
         let cfg = AppConfig {
             ingest: IngestConfig {
@@ -1107,7 +1232,129 @@ mod tests {
         let run_id = outcome.run_id.expect("candidate run id");
         let candidate = CandidatePaths::new(&paths, &run_id);
 
-        assert!(candidate.source_summaries.join("existing.md").exists());
+        assert!(!candidate.source_summaries.join("existing.md").exists());
+        assert!(
+            candidate
+                .source_summaries
+                .join(format!(
+                    "{}.md",
+                    source_id_for_url("https://example.test/doc")
+                ))
+                .exists()
+        );
+        assert!(!candidate.knowledge.join("index.md").exists());
+        assert!(!candidate.diff.exists());
+        let metadata = load_candidate_metadata(&paths, &run_id).expect("metadata");
+        assert_eq!(metadata.status, CandidateStatus::SummariesStaged);
+    }
+
+    #[test]
+    fn first_approve_generates_diff_without_changing_approved_knowledge() {
+        let root = unique_temp_dir("wiki-craft-first-approve-test");
+        let cfg = AppConfig {
+            runtime: crate::config::RuntimeConfig {
+                root: root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        fs::write(paths.knowledge_current.join("index.md"), "# Current\n").expect("current index");
+
+        let run_id = "run_first_approve_test";
+        let candidate = CandidatePaths::new(&paths, run_id);
+        candidate.ensure().expect("candidate dirs");
+        fs::write(candidate.source_summaries.join("source.md"), "# Summary\n")
+            .expect("candidate summary");
+        let metadata = candidate_metadata(
+            run_id.to_string(),
+            vec![test_changed_source()],
+            PromptCacheStats::default(),
+            0,
+        );
+        write_candidate_metadata(&candidate, &metadata).expect("metadata");
+
+        let mut generator = FakeGenerator::new();
+        let outcome =
+            approve_with_generator(&paths, run_id, &mut generator).expect("first approve");
+
+        assert_eq!(outcome.status, CandidateStatus::DiffReady);
+        assert_eq!(
+            fs::read_to_string(paths.knowledge_current.join("index.md")).expect("current index"),
+            "# Current\n"
+        );
+        assert_eq!(
+            fs::read_to_string(candidate.baseline_knowledge.join("index.md"))
+                .expect("baseline index"),
+            "# Current\n"
+        );
+        assert!(candidate.knowledge.join("index.md").exists());
+        assert!(candidate.diff.exists());
+        let metadata = load_candidate_metadata(&paths, run_id).expect("metadata");
+        assert_eq!(metadata.status, CandidateStatus::DiffReady);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reject_removes_candidate_without_changing_approved_knowledge() {
+        let root = unique_temp_dir("wiki-craft-reject-test");
+        fs::create_dir_all(&root).expect("test root");
+        let workspace_root = root.join(".wiki_craft");
+        let config_path = root.join("wiki_craft.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[runtime]\nroot = \"{}\"\nmax_steps = 4\n",
+                workspace_root.display()
+            ),
+        )
+        .expect("config");
+
+        let cfg = AppConfig {
+            runtime: crate::config::RuntimeConfig {
+                root: workspace_root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        fs::write(paths.knowledge_current.join("index.md"), "# Current\n").expect("current index");
+
+        let run_id = "run_reject_test";
+        let candidate = CandidatePaths::new(&paths, run_id);
+        candidate.ensure().expect("candidate dirs");
+        let changed = test_changed_source();
+        let metadata = candidate_metadata(
+            run_id.to_string(),
+            vec![changed.clone()],
+            PromptCacheStats::default(),
+            0,
+        );
+        write_candidate_metadata(&candidate, &metadata).expect("metadata");
+        let mut manifest = SourceManifest::load(&paths.manifest_path).expect("manifest");
+        manifest.stage_changed(
+            &test_fetched_source(),
+            run_id,
+            candidate
+                .source_summaries
+                .join("source.md")
+                .display()
+                .to_string(),
+        );
+        manifest.save(&paths.manifest_path).expect("manifest save");
+
+        reject(&config_path, run_id).expect("reject");
+
+        assert_eq!(
+            fs::read_to_string(paths.knowledge_current.join("index.md")).expect("current index"),
+            "# Current\n"
+        );
+        assert!(!candidate.root.exists());
+        let manifest = SourceManifest::load(&paths.manifest_path).expect("manifest");
+        assert!(!manifest.sources.contains_key(&changed.source_id));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1134,25 +1381,53 @@ mod tests {
         };
         let paths = WorkspacePaths::from_config(&cfg);
         paths.ensure_all().expect("workspace dirs");
+        fs::write(
+            paths.source_summaries_current.join("existing.md"),
+            "# Existing Summary\n",
+        )
+        .expect("existing summary");
         let run_id = "run_runtime_approve_test";
         let candidate = CandidatePaths::new(&paths, run_id);
         candidate.ensure().expect("candidate dirs");
+        fs::create_dir_all(&candidate.knowledge).expect("candidate knowledge dir");
         fs::write(candidate.knowledge.join("index.md"), "# Approved\n").expect("candidate index");
         fs::write(candidate.source_summaries.join("source.md"), "# Summary\n")
             .expect("candidate summary");
-        let metadata = candidate_metadata(
+        let mut metadata = candidate_metadata(
             run_id.to_string(),
-            Vec::new(),
+            vec![test_changed_source()],
             PromptCacheStats::default(),
             0,
         );
+        metadata.status = CandidateStatus::DiffReady;
         write_candidate_metadata(&candidate, &metadata).expect("metadata");
 
-        approve(&config_path, run_id).expect("approve");
+        let outcome = approve(&config_path, run_id).expect("approve");
 
+        assert_eq!(outcome.status, CandidateStatus::Approved);
         assert_eq!(
             fs::read_to_string(paths.knowledge_current.join("index.md")).expect("approved index"),
             "# Approved\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.source_summaries_current.join("source.md"))
+                .expect("approved summary"),
+            "# Summary\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.source_summaries_current.join("existing.md"))
+                .expect("existing approved summary"),
+            "# Existing Summary\n"
+        );
+        let manifest = SourceManifest::load(&paths.manifest_path).expect("manifest");
+        let record = manifest.sources.get("source").expect("source record");
+        assert_eq!(record.content_hash, "hash-new");
+        assert!(
+            record
+                .summary_path
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with(".wiki_craft/knowledge/approved/evidence/source_summaries/source.md")
         );
         assert!(!candidate.root.exists());
         let _ = fs::remove_dir_all(root);
@@ -1215,6 +1490,35 @@ mod tests {
             byte_count: text.len(),
             headers: BTreeMap::from([("etag".to_string(), "test".to_string())]),
             text: text.to_string(),
+        }
+    }
+
+    fn test_changed_source() -> ChangedSource {
+        ChangedSource {
+            source_id: "source".to_string(),
+            url: "https://example.test/doc".to_string(),
+            final_url: Some("https://example.test/doc".to_string()),
+            title: Some("Doc".to_string()),
+            etag: Some("test".to_string()),
+            last_modified: None,
+            previous_hash: None,
+            new_hash: "hash-new".to_string(),
+            version_key: Some("hash-new".to_string()),
+            summary_path: "evidence/source_summaries/source.md".to_string(),
+        }
+    }
+
+    fn test_fetched_source() -> FetchedSource {
+        FetchedSource {
+            source_id: "source".to_string(),
+            url: "https://example.test/doc".to_string(),
+            final_url: "https://example.test/doc".to_string(),
+            title: Some("Doc".to_string()),
+            etag: Some("test".to_string()),
+            last_modified: None,
+            normalized_text: "changed".to_string(),
+            content_hash: "hash-new".to_string(),
+            version_key: "hash-new".to_string(),
         }
     }
 }
