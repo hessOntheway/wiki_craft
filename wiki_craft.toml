@@ -5,7 +5,7 @@
 
 [[sources]]
 name = "example"
-url = "https://mp.weixin.qq.com/s/uTPxCmrG0S72Np8EQcmLyA"
+url = "https://gitcode.csdn.net/6a05afc310ee7a33f272901f.html"
 enabled = true
 timeout_seconds = 15
 max_bytes = 200000

@@ -1,11 +1,9 @@
-pub mod audit;
 pub mod candidates;
-pub mod compact;
 pub mod config;
 pub mod knowledge;
 pub mod llm;
-pub mod metrics;
 pub mod runtime;
 pub mod search;
 pub mod sources;
+pub(crate) mod support;
 pub mod tools;

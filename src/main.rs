@@ -50,6 +50,10 @@ enum Command {
         #[command(subcommand)]
         command: CandidateCommand,
     },
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -57,6 +61,11 @@ enum CandidateCommand {
     List,
     Diff { run_id: String },
     Approve { run_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum KnowledgeCommand {
+    Reorganize,
 }
 
 fn main() -> Result<()> {
@@ -107,11 +116,8 @@ fn main() -> Result<()> {
                 print!("{}", runtime::metrics_prometheus(&cli.config)?);
             } else {
                 let snapshot = runtime::metrics_snapshot(&cli.config)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
-                }
+                let _ = json;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
             }
         }
         Command::Candidates { command } => match command {
@@ -125,6 +131,12 @@ fn main() -> Result<()> {
             CandidateCommand::Approve { run_id } => {
                 runtime::approve(&cli.config, &run_id)?;
                 println!("approved {run_id}");
+            }
+        },
+        Command::Knowledge { command } => match command {
+            KnowledgeCommand::Reorganize => {
+                let outcome = runtime::reorganize(&cli.config)?;
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
             }
         },
     }

@@ -6,10 +6,10 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::audit::{append_event, llm_exchange_event};
 use crate::config::{ContextCompactConfig, ResolvedLlmConfig};
 use crate::llm::cache::PromptCache;
 use crate::llm::usage::{ModelUsage, PromptCacheStats};
+use crate::support::audit::{append_event, llm_exchange_event};
 use crate::tools::ToolDefinition;
 
 #[derive(Clone)]
@@ -24,6 +24,16 @@ pub struct ChatCompletionResult {
     pub message: Value,
     pub usage: ModelUsage,
     pub cached: bool,
+}
+
+struct AuditExchange<'a> {
+    request_hash: &'a str,
+    cached: bool,
+    messages: &'a [Value],
+    tools: &'a [ToolDefinition],
+    assistant_message: &'a Value,
+    usage: &'a ModelUsage,
+    audit_log_path_override: Option<&'a str>,
 }
 
 impl OpenAiCompatClient {
@@ -122,15 +132,15 @@ impl OpenAiCompatClient {
             && let Some(cached) = cache.lookup(&request_hash)?
         {
             eprintln!("info: local prompt cache hit");
-            self.write_audit_event(
-                &request_hash,
-                true,
+            self.write_audit_event(AuditExchange {
+                request_hash: &request_hash,
+                cached: true,
                 messages,
                 tools,
-                &cached.message,
-                &cached.usage,
+                assistant_message: &cached.message,
+                usage: &cached.usage,
                 audit_log_path_override,
-            );
+            });
             return Ok(cached);
         }
 
@@ -178,15 +188,15 @@ impl OpenAiCompatClient {
             usage: usage.clone(),
             cached: false,
         };
-        self.write_audit_event(
-            &request_hash,
-            false,
+        self.write_audit_event(AuditExchange {
+            request_hash: &request_hash,
+            cached: false,
             messages,
             tools,
-            &message,
-            &usage,
+            assistant_message: &message,
+            usage: &usage,
             audit_log_path_override,
-        );
+        });
         if let Some(cache) = &self.cache
             && let Err(error) = cache.store(&request_hash, &result)
         {
@@ -195,28 +205,21 @@ impl OpenAiCompatClient {
         Ok(result)
     }
 
-    fn write_audit_event(
-        &self,
-        request_hash: &str,
-        cached: bool,
-        messages: &[Value],
-        tools: &[ToolDefinition],
-        assistant_message: &Value,
-        usage: &ModelUsage,
-        audit_log_path_override: Option<&str>,
-    ) {
+    fn write_audit_event(&self, exchange: AuditExchange<'_>) {
         if !self.cfg.write_model_audit_log {
             return;
         }
-        let path = audit_log_path_override.unwrap_or(&self.cfg.model_audit_log_path);
+        let path = exchange
+            .audit_log_path_override
+            .unwrap_or(&self.cfg.model_audit_log_path);
         let event = llm_exchange_event(
             self.cfg.model.clone(),
-            request_hash.to_string(),
-            cached,
-            messages,
-            tools,
-            assistant_message,
-            usage.clone(),
+            exchange.request_hash.to_string(),
+            exchange.cached,
+            exchange.messages,
+            exchange.tools,
+            exchange.assistant_message,
+            exchange.usage.clone(),
         );
         if let Err(error) = append_event(path, &event) {
             eprintln!("warn: failed to append llm audit event: {error}");

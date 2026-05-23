@@ -7,8 +7,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::knowledge::{DEFAULT_SCHEMA_PATH, WorkspacePaths};
+use crate::knowledge::WorkspacePaths;
+use crate::knowledge::{
+    VAULT_INDEX_PATH, VAULT_TOPICS_DIR, VaultFrontmatter, extract_wikilinks, parse_vault_markdown,
+};
 use crate::sources::SourceManifest;
+use crate::support::{markdown_heading, sort_dedup_nonempty, truncate_chars};
 
 const DEFAULT_SNIPPET_MAX_CHARS: usize = 1200;
 
@@ -22,7 +26,6 @@ pub struct SearchOptions {
 pub struct SearchResponse {
     pub query: String,
     pub top_k: usize,
-    pub searched_paths: Vec<String>,
     pub results: Vec<SearchResult>,
 }
 
@@ -30,20 +33,26 @@ pub struct SearchResponse {
 pub struct SearchResult {
     pub path: String,
     pub kind: SearchResultKind,
+    pub title: Option<String>,
     pub heading: Option<String>,
     pub score: f64,
     pub line_start: usize,
     pub line_end: usize,
     pub snippet: String,
+    pub aliases: Vec<String>,
+    pub tags: Vec<String>,
+    pub wikilinks: Vec<String>,
+    pub source_ids: Vec<String>,
     pub source_urls: Vec<String>,
     pub version_hashes: Vec<String>,
+    pub updated_at_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchResultKind {
-    Schema,
-    Knowledge,
+    Index,
+    Topic,
     SourceSummary,
 }
 
@@ -51,20 +60,21 @@ pub enum SearchResultKind {
 struct SearchDocument {
     display_path: String,
     kind: SearchResultKind,
-    text: String,
-    manifest_url: Option<String>,
-    manifest_hash: Option<String>,
+    frontmatter: VaultFrontmatter,
+    body: String,
+    body_start_line: usize,
+    wikilinks: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct SearchChunk {
     display_path: String,
     kind: SearchResultKind,
+    frontmatter: VaultFrontmatter,
+    wikilinks: Vec<String>,
     heading: Option<String>,
     text: String,
     line_start: usize,
-    manifest_url: Option<String>,
-    manifest_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,16 +91,10 @@ pub fn search_configured(config_path: &Path, options: SearchOptions) -> Result<S
     }
     let top_k = options.top_k.max(1);
     let config = AppConfig::load_or_default(config_path)?;
-    let project_root = config_project_root(config_path);
-    let paths = workspace_paths_for_search(config, &project_root);
-    let schema_path = project_root.join(DEFAULT_SCHEMA_PATH);
+    let paths = workspace_paths_for_search(config, config_path);
 
     let manifest = SourceManifest::load(&paths.manifest_path).unwrap_or_default();
-    let documents = collect_documents(&schema_path, &paths, &manifest)?;
-    let searched_paths = documents
-        .iter()
-        .map(|document| document.display_path.clone())
-        .collect::<Vec<_>>();
+    let documents = collect_documents(&paths, &manifest)?;
     let terms = query_terms(&options.query);
     let mut scored = documents
         .iter()
@@ -102,6 +106,7 @@ pub fn search_configured(config_path: &Path, options: SearchOptions) -> Result<S
         right_score
             .partial_cmp(left_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| kind_rank(left_chunk.kind).cmp(&kind_rank(right_chunk.kind)))
             .then_with(|| left_chunk.display_path.cmp(&right_chunk.display_path))
             .then_with(|| left_chunk.line_start.cmp(&right_chunk.line_start))
     });
@@ -115,7 +120,6 @@ pub fn search_configured(config_path: &Path, options: SearchOptions) -> Result<S
     Ok(SearchResponse {
         query: options.query,
         top_k,
-        searched_paths,
         results,
     })
 }
@@ -132,12 +136,19 @@ pub fn render_text_response(response: &SearchResponse) -> String {
             .as_ref()
             .map(|heading| format!(" - {heading}"))
             .unwrap_or_default();
+        let title = result
+            .title
+            .as_ref()
+            .map(|title| format!(" ({title})"))
+            .unwrap_or_default();
         out.push(format!(
-            "{}. {}:{}{} [score {:.2}]",
+            "{}. {}:{}{}{} [{:?}, score {:.2}]",
             idx + 1,
             result.path,
             result.line_start,
+            title,
             heading,
+            result.kind,
             result.score
         ));
         if !result.source_urls.is_empty() {
@@ -148,9 +159,9 @@ pub fn render_text_response(response: &SearchResponse) -> String {
     out.join("\n")
 }
 
-fn workspace_paths_for_search(mut config: AppConfig, project_root: &Path) -> WorkspacePaths {
+fn workspace_paths_for_search(mut config: AppConfig, config_path: &Path) -> WorkspacePaths {
     if Path::new(&config.runtime.root).is_relative() {
-        config.runtime.root = project_root
+        config.runtime.root = config_project_root(config_path)
             .join(&config.runtime.root)
             .to_string_lossy()
             .to_string();
@@ -167,33 +178,36 @@ fn config_project_root(config_path: &Path) -> PathBuf {
 }
 
 fn collect_documents(
-    schema_path: &Path,
     paths: &WorkspacePaths,
     manifest: &SourceManifest,
 ) -> Result<Vec<SearchDocument>> {
     let mut documents = Vec::new();
-    if schema_path.exists() {
-        documents.push(read_document(
-            schema_path,
-            SearchResultKind::Schema,
+    let knowledge_root = &paths.knowledge_current;
+    let index_path = knowledge_root.join(VAULT_INDEX_PATH);
+    if index_path.exists() {
+        documents.push(read_vault_document(
+            &index_path,
+            SearchResultKind::Index,
             None,
             None,
         )?);
     }
-    documents.extend(read_markdown_dir(
-        &paths.knowledge_current,
-        SearchResultKind::Knowledge,
+
+    documents.extend(read_vault_markdown_dir(
+        &knowledge_root.join(VAULT_TOPICS_DIR),
+        SearchResultKind::Topic,
         manifest,
     )?);
-    documents.extend(read_markdown_dir(
+    documents.extend(read_vault_markdown_dir(
         &paths.source_summaries_current,
         SearchResultKind::SourceSummary,
         manifest,
     )?);
+    documents.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     Ok(documents)
 }
 
-fn read_markdown_dir(
+fn read_vault_markdown_dir(
     root: &Path,
     kind: SearchResultKind,
     manifest: &SourceManifest,
@@ -213,18 +227,17 @@ fn read_markdown_dir(
         }
         let source_id = path.file_stem().and_then(|stem| stem.to_str());
         let record = source_id.and_then(|source_id| manifest.sources.get(source_id));
-        documents.push(read_document(
+        documents.push(read_vault_document(
             path,
             kind,
             record.map(|record| record.url.clone()),
             record.map(|record| record.content_hash.clone()),
         )?);
     }
-    documents.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     Ok(documents)
 }
 
-fn read_document(
+fn read_vault_document(
     path: &Path,
     kind: SearchResultKind,
     manifest_url: Option<String>,
@@ -232,33 +245,49 @@ fn read_document(
 ) -> Result<SearchDocument> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed = parse_vault_markdown(&text);
+    let mut frontmatter = parsed.frontmatter;
+    if let Some(url) = manifest_url {
+        frontmatter.source_urls.push(url);
+    }
+    if let Some(hash) = manifest_hash {
+        frontmatter.version_hashes.push(hash);
+    }
+    frontmatter.source_urls.extend(extract_urls(&parsed.body));
+    frontmatter
+        .version_hashes
+        .extend(extract_hashes(&parsed.body));
+    normalize_frontmatter_lists(&mut frontmatter);
+    let wikilinks = extract_wikilinks(&parsed.body);
+
     Ok(SearchDocument {
         display_path: path.display().to_string(),
         kind,
-        text,
-        manifest_url,
-        manifest_hash,
+        frontmatter,
+        body: parsed.body,
+        body_start_line: parsed.body_start_line,
+        wikilinks,
     })
 }
 
 fn split_document(document: &SearchDocument) -> Vec<SearchChunk> {
     let mut chunks = Vec::new();
     let mut current_heading = None;
-    let mut current_start = 1usize;
+    let mut current_start = document.body_start_line;
     let mut current_lines = Vec::<String>::new();
 
-    for (idx, line) in document.text.lines().enumerate() {
-        let line_number = idx + 1;
+    for (idx, line) in document.body.lines().enumerate() {
+        let line_number = document.body_start_line + idx;
         if let Some(heading) = markdown_heading(line) {
             if !current_lines.is_empty() {
                 chunks.push(SearchChunk {
                     display_path: document.display_path.clone(),
                     kind: document.kind,
+                    frontmatter: document.frontmatter.clone(),
+                    wikilinks: document.wikilinks.clone(),
                     heading: current_heading.clone(),
                     text: current_lines.join("\n"),
                     line_start: current_start,
-                    manifest_url: document.manifest_url.clone(),
-                    manifest_hash: document.manifest_hash.clone(),
                 });
             }
             current_heading = Some(heading);
@@ -273,45 +302,27 @@ fn split_document(document: &SearchDocument) -> Vec<SearchChunk> {
         chunks.push(SearchChunk {
             display_path: document.display_path.clone(),
             kind: document.kind,
+            frontmatter: document.frontmatter.clone(),
+            wikilinks: document.wikilinks.clone(),
             heading: current_heading,
             text: current_lines.join("\n"),
             line_start: current_start,
-            manifest_url: document.manifest_url.clone(),
-            manifest_hash: document.manifest_hash.clone(),
         });
     }
 
-    if chunks.is_empty() && !document.text.trim().is_empty() {
+    if chunks.is_empty() && !document.body.trim().is_empty() {
         chunks.push(SearchChunk {
             display_path: document.display_path.clone(),
             kind: document.kind,
+            frontmatter: document.frontmatter.clone(),
+            wikilinks: document.wikilinks.clone(),
             heading: None,
-            text: document.text.clone(),
-            line_start: 1,
-            manifest_url: document.manifest_url.clone(),
-            manifest_hash: document.manifest_hash.clone(),
+            text: document.body.clone(),
+            line_start: document.body_start_line,
         });
     }
 
     chunks
-}
-
-fn markdown_heading(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    let level = trimmed.chars().take_while(|char| *char == '#').count();
-    if level == 0 || level > 6 {
-        return None;
-    }
-    let rest = trimmed.get(level..)?;
-    if !rest.starts_with(' ') {
-        return None;
-    }
-    let heading = rest.trim();
-    if heading.is_empty() {
-        None
-    } else {
-        Some(heading.to_string())
-    }
 }
 
 fn query_terms(query: &str) -> QueryTerms {
@@ -341,75 +352,97 @@ fn query_terms(query: &str) -> QueryTerms {
 }
 
 fn score_chunk(chunk: &SearchChunk, terms: &QueryTerms) -> Option<f64> {
-    let text = chunk.text.to_lowercase();
-    let compact_text = text.split_whitespace().collect::<String>();
-    let heading = chunk.heading.clone().unwrap_or_default().to_lowercase();
+    let frontmatter = &chunk.frontmatter;
+    let title = frontmatter.title.clone().unwrap_or_default();
+    let heading = chunk.heading.clone().unwrap_or_default();
+
     let mut score = 0.0;
-
-    if !terms.phrase.is_empty() && text.contains(&terms.phrase) {
-        score += 12.0;
-    }
-    if !terms.compact_phrase.is_empty()
-        && terms.compact_phrase != terms.phrase
-        && compact_text.contains(&terms.compact_phrase)
-    {
-        score += 8.0;
-    }
-
-    for word in &terms.words {
-        let count = count_occurrences(&text, word);
-        if count > 0 {
-            score += 2.5 * count as f64;
-        }
-        if heading.contains(word) {
-            score += 4.0;
-        }
-    }
-
-    for cjk in &terms.cjk_chars {
-        let count = text.chars().filter(|char| char == cjk).take(8).count();
-        if count > 0 {
-            score += 0.35 * count as f64;
-        }
-        if heading.contains(*cjk) {
-            score += 1.0;
-        }
-    }
+    score += score_text(&title, terms, 32.0, 12.0, 2.0, 1.8);
+    score += score_text(&frontmatter.aliases.join(" "), terms, 24.0, 9.0, 1.6, 1.4);
+    score += score_text(&frontmatter.tags.join(" "), terms, 16.0, 6.0, 1.2, 1.0);
+    score += score_text(&chunk.wikilinks.join(" "), terms, 14.0, 5.0, 1.0, 0.9);
+    score += score_text(&heading, terms, 20.0, 7.0, 1.5, 1.2);
+    score += score_text(&frontmatter.source_ids.join(" "), terms, 8.0, 3.0, 0.6, 0.4);
+    score += score_text(
+        &frontmatter.source_urls.join(" "),
+        terms,
+        6.0,
+        2.0,
+        0.4,
+        0.3,
+    );
+    score += score_text(&chunk.text, terms, 12.0, 2.5, 0.35, 0.35);
 
     if score <= 0.0 {
         return None;
     }
 
-    let length_penalty = 1.0 + (chunk.text.chars().count() as f64 / 1800.0).sqrt();
-    Some(round_score(score / length_penalty))
+    let priority_bonus = match chunk.kind {
+        SearchResultKind::Topic => 8.0,
+        SearchResultKind::Index => 3.0,
+        SearchResultKind::SourceSummary => 0.0,
+    };
+    let length_penalty = 1.0 + (chunk.text.chars().count() as f64 / 2200.0).sqrt();
+    Some(round_score((score + priority_bonus) / length_penalty))
+}
+
+fn score_text(
+    text: &str,
+    terms: &QueryTerms,
+    phrase_score: f64,
+    word_score: f64,
+    cjk_score: f64,
+    compact_score: f64,
+) -> f64 {
+    if text.trim().is_empty() {
+        return 0.0;
+    }
+    let lower = text.to_lowercase();
+    let compact = lower.split_whitespace().collect::<String>();
+    let mut score = 0.0;
+
+    if !terms.phrase.is_empty() && lower.contains(&terms.phrase) {
+        score += phrase_score;
+    }
+    if !terms.compact_phrase.is_empty()
+        && terms.compact_phrase != terms.phrase
+        && compact.contains(&terms.compact_phrase)
+    {
+        score += compact_score;
+    }
+    for word in &terms.words {
+        let count = count_occurrences(&lower, word);
+        if count > 0 {
+            score += word_score * count as f64;
+        }
+    }
+    for cjk in &terms.cjk_chars {
+        let count = lower.chars().filter(|char| char == cjk).take(8).count();
+        if count > 0 {
+            score += cjk_score * count as f64;
+        }
+    }
+    score
 }
 
 fn chunk_to_result(chunk: SearchChunk, score: f64, terms: &QueryTerms) -> SearchResult {
     let (snippet, line_start, line_end) = best_snippet(&chunk, terms);
-    let mut source_urls = extract_urls(&chunk.text);
-    if let Some(url) = chunk.manifest_url {
-        source_urls.push(url);
-    }
-    source_urls.sort();
-    source_urls.dedup();
-
-    let mut version_hashes = extract_hashes(&chunk.text);
-    if let Some(hash) = chunk.manifest_hash {
-        version_hashes.push(hash);
-    }
-    version_hashes.sort();
-    version_hashes.dedup();
-
     SearchResult {
         path: chunk.display_path,
         kind: chunk.kind,
+        title: chunk.frontmatter.title,
         heading: chunk.heading,
         score,
         line_start,
         line_end,
         snippet,
-        source_urls,
-        version_hashes,
+        aliases: chunk.frontmatter.aliases,
+        tags: chunk.frontmatter.tags,
+        wikilinks: chunk.wikilinks,
+        source_ids: chunk.frontmatter.source_ids,
+        source_urls: chunk.frontmatter.source_urls,
+        version_hashes: chunk.frontmatter.version_hashes,
+        updated_at_run_id: chunk.frontmatter.updated_at_run_id,
     }
 }
 
@@ -432,6 +465,15 @@ fn best_snippet(chunk: &SearchChunk, terms: &QueryTerms) -> (String, usize, usiz
 fn line_matches(line: &str, terms: &QueryTerms) -> bool {
     let lower = line.to_lowercase();
     if !terms.phrase.is_empty() && lower.contains(&terms.phrase) {
+        return true;
+    }
+    if !terms.compact_phrase.is_empty()
+        && terms.compact_phrase != terms.phrase
+        && lower
+            .split_whitespace()
+            .collect::<String>()
+            .contains(&terms.compact_phrase)
+    {
         return true;
     }
     if terms.words.iter().any(|word| lower.contains(word)) {
@@ -474,13 +516,12 @@ fn collect_regex_matches(regex: &Regex, text: &str) -> Vec<String> {
     values
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    truncated.push_str("...");
-    truncated
+fn normalize_frontmatter_lists(frontmatter: &mut VaultFrontmatter) {
+    sort_dedup_nonempty(&mut frontmatter.aliases);
+    sort_dedup_nonempty(&mut frontmatter.tags);
+    sort_dedup_nonempty(&mut frontmatter.source_ids);
+    sort_dedup_nonempty(&mut frontmatter.source_urls);
+    sort_dedup_nonempty(&mut frontmatter.version_hashes);
 }
 
 fn indent_snippet(snippet: &str) -> String {
@@ -495,6 +536,14 @@ fn round_score(score: f64) -> f64 {
     (score * 100.0).round() / 100.0
 }
 
+fn kind_rank(kind: SearchResultKind) -> usize {
+    match kind {
+        SearchResultKind::Topic => 0,
+        SearchResultKind::Index => 1,
+        SearchResultKind::SourceSummary => 2,
+    }
+}
+
 fn is_cjk(char: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&char)
         || ('\u{3400}'..='\u{4dbf}').contains(&char)
@@ -504,44 +553,54 @@ fn is_cjk(char: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
     #[test]
-    fn splits_markdown_by_heading() {
+    fn splits_markdown_by_heading_after_frontmatter() {
         let document = SearchDocument {
-            display_path: "Home.md".to_string(),
-            kind: SearchResultKind::Knowledge,
-            text: "# Home\nintro\n\n## Install\ncargo run".to_string(),
-            manifest_url: None,
-            manifest_hash: None,
+            display_path: "topics/home.md".to_string(),
+            kind: SearchResultKind::Topic,
+            frontmatter: VaultFrontmatter {
+                title: Some("Home".to_string()),
+                ..Default::default()
+            },
+            body: "# Home\nintro\n\n## Install\ncargo run".to_string(),
+            body_start_line: 8,
+            wikilinks: Vec::new(),
         };
         let chunks = split_document(&document);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading.as_deref(), Some("Home"));
         assert_eq!(chunks[1].heading.as_deref(), Some("Install"));
-        assert_eq!(chunks[1].line_start, 4);
+        assert_eq!(chunks[1].line_start, 11);
     }
 
     #[test]
-    fn searches_only_approved_current_dirs() {
+    fn searches_only_approved_current_vault_dirs() {
         let root = unique_temp_dir();
-        fs::create_dir_all(root.join(".wiki_craft/knowledge/current")).unwrap();
-        fs::create_dir_all(root.join(".wiki_craft/candidates/run_1/knowledge")).unwrap();
+        fs::create_dir_all(root.join(".wiki_craft/knowledge/current/topics")).unwrap();
+        fs::create_dir_all(root.join(".wiki_craft/candidates/run_1/knowledge/topics")).unwrap();
         fs::write(
             root.join("wiki_craft.toml"),
             "[runtime]\nroot = \".wiki_craft\"\n",
         )
         .unwrap();
-        fs::write(root.join("WIKI_CRAFT.md"), "# Schema\napproved only").unwrap();
         fs::write(
-            root.join(".wiki_craft/knowledge/current/Home.md"),
-            "# Home\nstable llama retrieval",
+            root.join(".wiki_craft/knowledge/current/index.md"),
+            "# Index\n\n- [[topics/home|Home]]",
         )
         .unwrap();
         fs::write(
-            root.join(".wiki_craft/candidates/run_1/knowledge/Home.md"),
+            root.join(".wiki_craft/knowledge/current/topics/home.md"),
+            "---\ntitle: \"Retrieval\"\naliases: [lookup]\ntags: [memory]\nsource_ids: []\nsource_urls: []\nversion_hashes: []\n---\n\n# Retrieval\nstable llama retrieval",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".wiki_craft/candidates/run_1/knowledge/topics/draft.md"),
             "# Candidate\nsecret draft term",
         )
         .unwrap();
@@ -555,10 +614,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].kind, SearchResultKind::Topic);
         assert!(
             response.results[0]
                 .path
-                .ends_with(".wiki_craft/knowledge/current/Home.md")
+                .ends_with(".wiki_craft/knowledge/current/topics/home.md")
         );
 
         let draft_response = search_configured(
@@ -575,34 +635,49 @@ mod tests {
     }
 
     #[test]
-    fn extracts_urls_and_hashes_from_result() {
-        let chunk = SearchChunk {
-            display_path: "summary.md".to_string(),
-            kind: SearchResultKind::SourceSummary,
-            heading: Some("Source".to_string()),
-            text: "Source: https://example.com/a.\nVersion hash: abcdef1234567890".to_string(),
-            line_start: 1,
-            manifest_url: Some("https://example.com/manifest".to_string()),
-            manifest_hash: Some(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            ),
-        };
-        let result = chunk_to_result(chunk, 1.0, &query_terms("source"));
+    fn topic_metadata_can_beat_source_summary_body_match() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(root.join(".wiki_craft/knowledge/current/topics")).unwrap();
+        fs::create_dir_all(root.join(".wiki_craft/source_summaries/current")).unwrap();
+        fs::write(
+            root.join("wiki_craft.toml"),
+            "[runtime]\nroot = \".wiki_craft\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".wiki_craft/knowledge/current/index.md"),
+            "# Index",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".wiki_craft/knowledge/current/topics/search.md"),
+            "---\ntitle: \"Search\"\naliases: [retrieval]\ntags: [lookup]\nsource_ids: [s1]\nsource_urls: [https://example.test]\nversion_hashes: [abcdef1234567890]\n---\n\n# Search\nShort note.",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".wiki_craft/source_summaries/current/s1.md"),
+            "# Source\n\nretrieval retrieval retrieval evidence",
+        )
+        .unwrap();
+
+        let response = search_configured(
+            &root.join("wiki_craft.toml"),
+            SearchOptions {
+                query: "retrieval".to_string(),
+                top_k: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.results[0].kind, SearchResultKind::Topic);
+        assert_eq!(response.results[0].title.as_deref(), Some("Search"));
         assert!(
-            result
+            response.results[0]
                 .source_urls
-                .contains(&"https://example.com/a".to_string())
+                .contains(&"https://example.test".to_string())
         );
-        assert!(
-            result
-                .source_urls
-                .contains(&"https://example.com/manifest".to_string())
-        );
-        assert!(
-            result
-                .version_hashes
-                .contains(&"abcdef1234567890".to_string())
-        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn unique_temp_dir() -> PathBuf {

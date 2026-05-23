@@ -6,7 +6,8 @@ This file is the operating contract for Wiki Craft and for AI coding tools that 
 
 Read approved knowledge from:
 
-- `.wiki_craft/knowledge/current/`
+- `.wiki_craft/knowledge/current/index.md`
+- `.wiki_craft/knowledge/current/topics/*.md`
 - `.wiki_craft/source_summaries/current/`
 
 Candidate updates under `.wiki_craft/candidates/{run_id}/` are not authoritative until approved.
@@ -21,7 +22,16 @@ Candidate updates under `.wiki_craft/candidates/{run_id}/` are not authoritative
 - Mark conflicts, uncertainty, and changed claims explicitly.
 - Stage every knowledge update as a candidate and review `diff.md` before approval.
 
-## v1 Retrieval Surface
+## Vault Layout
+
+- The approved wiki is an Obsidian-style vault.
+- `index.md` is the entry point and should link to major topic pages.
+- `topics/*.md` are topic-first pages, not source-first pages.
+- Topic pages should use YAML frontmatter with `title`, `aliases`, `tags`, `source_ids`, `source_urls`, `version_hashes`, and `updated_at_run_id`.
+- Use wikilinks between related topics.
+- Keep source summaries as evidence, not as the main navigation layer.
+
+## Retrieval Surface
 
 Codex and similar tools should call:
 
@@ -29,4 +39,4 @@ Codex and similar tools should call:
 cargo run -- search --query "<question>" --top-k 5 --json
 ```
 
-The search command is read-only and returns approved Markdown snippets with paths, line numbers, source URLs, and version hashes when available.
+The search command is read-only and returns approved topic pages before source summaries when relevance is comparable. It returns paths, kinds, titles, aliases, tags, wikilinks, line numbers, snippets, source URLs, and version hashes when available.

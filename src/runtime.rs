@@ -4,63 +4,52 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::audit::{append_event, compaction_event, tool_call_event, tool_result_event};
 use crate::candidates::{
-    CandidatePaths, approve_candidate, candidate_metadata, list_candidates,
+    CandidatePaths, approve_candidate, candidate_metadata, copy_dir, list_candidates,
     load_candidate_metadata, new_run_id, read_diff, write_candidate_metadata, write_diff,
 };
-use crate::compact::{auto_compact_if_needed, remove_orphan_tool_messages};
 use crate::config::AppConfig;
 use crate::config::SourceConfig;
+use crate::knowledge::{
+    VaultFile, build_reorganized_vault, parse_vault_payload, write_vault_files,
+};
 use crate::knowledge::{WorkspacePaths, read_current_knowledge};
 use crate::llm::openai::{OpenAiCompatClient, extract_message_text};
 use crate::llm::session::ConversationSession;
 use crate::llm::usage::PromptCacheStats;
-use crate::metrics::{
+use crate::sources::{ChangedSource, FetchedSource, SourceManifest, fetched_from_output};
+use crate::support::audit::{append_event, compaction_event, tool_call_event, tool_result_event};
+use crate::support::compact::{auto_compact_if_needed, remove_orphan_tool_messages};
+use crate::support::metrics::{
     MetricsInput, MetricsSnapshot, read_metrics, render_prometheus, write_metrics,
 };
-use crate::sources::{
-    ChangedSource, FetchedSource, SourceManifest, fetched_from_output, source_id_for_url,
-};
+use crate::support::now_unix_ms;
 use crate::tools::{GlobalToolRegistry, WebFetchInput, WebFetchOutput, run_web_fetch};
 
 #[derive(Debug, Clone)]
-pub enum RuntimeEvent {
-    AssistantMessage(Value),
-    Compaction {
-        removed_messages: usize,
-        estimated_tokens_before: usize,
-        transcript_path: Option<String>,
-    },
-    ToolCall {
-        tool_call_id: String,
-        name: String,
-        arguments: String,
-    },
-    ToolResult {
-        tool_call_id: String,
-        name: String,
-        arguments: String,
-        result: String,
-    },
+pub(crate) enum RuntimeEvent {
+    AssistantMessage,
+    Compaction,
+    ToolCall,
+    ToolResult,
 }
 
-pub type RuntimeEventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
+pub(crate) type RuntimeEventSink = Arc<dyn Fn(RuntimeEvent) + Send + Sync>;
 
-pub struct AgentLoop {
+pub(crate) struct AgentLoop {
     llm: Arc<OpenAiCompatClient>,
     max_steps: usize,
     audit_log_path: Option<String>,
 }
 
 impl AgentLoop {
-    pub fn new(llm: Arc<OpenAiCompatClient>, max_steps: usize) -> Self {
+    pub(crate) fn new(llm: Arc<OpenAiCompatClient>, max_steps: usize) -> Self {
         Self {
             llm,
             max_steps,
@@ -68,12 +57,12 @@ impl AgentLoop {
         }
     }
 
-    pub fn with_audit_log_path(mut self, audit_log_path: Option<String>) -> Self {
+    pub(crate) fn with_audit_log_path(mut self, audit_log_path: Option<String>) -> Self {
         self.audit_log_path = audit_log_path;
         self
     }
 
-    pub fn run_session_turn_with_events(
+    pub(crate) fn run_session_turn_with_events(
         &self,
         session: &mut ConversationSession,
         tool_registry: &GlobalToolRegistry,
@@ -114,11 +103,7 @@ impl AgentLoop {
                     .as_ref()
                     .map(|path| path.display().to_string());
                 if let Some(sink) = &event_sink {
-                    sink(RuntimeEvent::Compaction {
-                        removed_messages: event.removed_messages,
-                        estimated_tokens_before: event.estimated_tokens_before,
-                        transcript_path: transcript_path.clone(),
-                    });
+                    sink(RuntimeEvent::Compaction);
                 }
                 if let Some(path) = &self.audit_log_path {
                     let event = compaction_event(
@@ -144,7 +129,7 @@ impl AgentLoop {
 
             messages.push(assistant.message.clone());
             if let Some(sink) = &event_sink {
-                sink(RuntimeEvent::AssistantMessage(assistant.message.clone()));
+                sink(RuntimeEvent::AssistantMessage);
             }
 
             let tool_calls = assistant
@@ -174,11 +159,7 @@ impl AgentLoop {
                     .and_then(Value::as_str)
                     .context("tool function arguments missing")?;
                 if let Some(sink) = &event_sink {
-                    sink(RuntimeEvent::ToolCall {
-                        tool_call_id: tool_id.to_string(),
-                        name: name.to_string(),
-                        arguments: arguments.to_string(),
-                    });
+                    sink(RuntimeEvent::ToolCall);
                 }
                 if let Some(path) = &self.audit_log_path {
                     let event = tool_call_event(
@@ -196,12 +177,7 @@ impl AgentLoop {
                 };
                 let is_error = result.starts_with("tool_error:");
                 if let Some(sink) = &event_sink {
-                    sink(RuntimeEvent::ToolResult {
-                        tool_call_id: tool_id.to_string(),
-                        name: name.to_string(),
-                        arguments: arguments.to_string(),
-                        result: result.clone(),
-                    });
+                    sink(RuntimeEvent::ToolResult);
                 }
                 if let Some(path) = &self.audit_log_path {
                     let event = tool_result_event(
@@ -229,28 +205,28 @@ impl AgentLoop {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GenerationTelemetry {
+pub(crate) struct GenerationTelemetry {
     #[serde(default)]
     pub prompt_cache_stats: PromptCacheStats,
     #[serde(default)]
     pub compaction_count: u64,
 }
 
-pub trait KnowledgeGenerator {
+pub(crate) trait KnowledgeGenerator {
     fn generate_source_summary(&mut self, source: &FetchedSource) -> Result<String>;
     fn generate_candidate_knowledge(
         &mut self,
         changed_summaries: &[(ChangedSource, String)],
         current_knowledge: &str,
-    ) -> Result<String>;
+    ) -> Result<Vec<VaultFile>>;
     fn telemetry(&self) -> GenerationTelemetry;
 }
 
-pub trait SourceFetcher {
+pub(crate) trait SourceFetcher {
     fn fetch(&mut self, source: &SourceConfig) -> Result<WebFetchOutput>;
 }
 
-pub struct WebSourceFetcher;
+pub(crate) struct WebSourceFetcher;
 
 impl SourceFetcher for WebSourceFetcher {
     fn fetch(&mut self, source: &SourceConfig) -> Result<WebFetchOutput> {
@@ -263,7 +239,7 @@ impl SourceFetcher for WebSourceFetcher {
     }
 }
 
-pub struct LlmKnowledgeGenerator {
+pub(crate) struct LlmKnowledgeGenerator {
     llm: Arc<OpenAiCompatClient>,
     paths: WorkspacePaths,
     max_steps: usize,
@@ -271,7 +247,7 @@ pub struct LlmKnowledgeGenerator {
 }
 
 impl LlmKnowledgeGenerator {
-    pub fn new(config: &AppConfig, paths: WorkspacePaths) -> Result<Self> {
+    pub(crate) fn new(config: &AppConfig, paths: WorkspacePaths) -> Result<Self> {
         let resolved = config.resolve_llm();
         let llm = Arc::new(OpenAiCompatClient::new(resolved)?);
         Ok(Self {
@@ -283,14 +259,14 @@ impl LlmKnowledgeGenerator {
     }
 }
 
-pub struct LazyLlmKnowledgeGenerator {
+pub(crate) struct LazyLlmKnowledgeGenerator {
     config: AppConfig,
     paths: WorkspacePaths,
     inner: Option<LlmKnowledgeGenerator>,
 }
 
 impl LazyLlmKnowledgeGenerator {
-    pub fn new(config: AppConfig, paths: WorkspacePaths) -> Self {
+    pub(crate) fn new(config: AppConfig, paths: WorkspacePaths) -> Self {
         Self {
             config,
             paths,
@@ -318,7 +294,7 @@ impl KnowledgeGenerator for LazyLlmKnowledgeGenerator {
         &mut self,
         changed_summaries: &[(ChangedSource, String)],
         current_knowledge: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<VaultFile>> {
         self.inner_mut()?
             .generate_candidate_knowledge(changed_summaries, current_knowledge)
     }
@@ -361,7 +337,7 @@ Do not reproduce long raw passages."#;
         &mut self,
         changed_summaries: &[(ChangedSource, String)],
         current_knowledge: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<VaultFile>> {
         let schema = fs::read_to_string("WIKI_CRAFT.md").unwrap_or_else(|_| {
             "Maintain a Markdown-first knowledge base. Stage changes before approval.".to_string()
         });
@@ -378,10 +354,21 @@ Do not reproduce long raw passages."#;
         let system = r#"You are Wiki Craft's wiki maintainer.
 
 Your job is to update the candidate Markdown knowledge base from approved current knowledge and new source summaries.
-Never assume candidate output is approved. Output only the full Markdown content for Home.md.
-Keep links to source URLs, mark conflicts clearly, and avoid storing raw source text."#;
+Never assume candidate output is approved.
+Return only JSON, with this exact shape:
+{"files":[{"path":"index.md","content":"..."},{"path":"topics/topic-slug.md","content":"..."}]}
+
+The candidate knowledge base is an Obsidian-style vault:
+- index.md is the entry point and links to topic pages.
+- topic pages live under topics/*.md.
+- every file must be Markdown with YAML frontmatter containing title, aliases, tags, source_ids, source_urls, version_hashes, and updated_at_run_id.
+- organize by topic first, not by source.
+- use wikilinks between related topics.
+- keep source URLs and version hashes as metadata/evidence.
+- mark conflicts, uncertainty, and changed claims clearly.
+- do not store raw source text."#;
         let user = format!(
-            "WIKI_CRAFT schema:\n{schema}\n\nCurrent approved knowledge:\n{current_knowledge}\n\nChanged source summaries:\n{summaries}\n\nReturn the complete candidate Home.md."
+            "WIKI_CRAFT schema:\n{schema}\n\nCurrent approved knowledge:\n{current_knowledge}\n\nChanged source summaries:\n{summaries}\n\nReturn the complete candidate vault JSON."
         );
         let session_id = format!("knowledge_{}", now_unix_ms());
         let mut session =
@@ -389,7 +376,7 @@ Keep links to source URLs, mark conflicts clearly, and avoid storing raw source 
         let compactions = Arc::new(Mutex::new(0u64));
         let compactions_for_sink = Arc::clone(&compactions);
         let sink: RuntimeEventSink = Arc::new(move |event| {
-            if matches!(event, RuntimeEvent::Compaction { .. })
+            if matches!(event, RuntimeEvent::Compaction)
                 && let Ok(mut count) = compactions_for_sink.lock()
             {
                 *count += 1;
@@ -409,7 +396,7 @@ Keep links to source URLs, mark conflicts clearly, and avoid storing raw source 
             .prompt_cache_stats
             .merge(&session.snapshot().prompt_cache_stats);
         session.save()?;
-        Ok(output)
+        parse_vault_payload(&output)
     }
 
     fn telemetry(&self) -> GenerationTelemetry {
@@ -435,6 +422,13 @@ pub struct IngestOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorganizeOutcome {
+    pub run_id: String,
+    pub files: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub schema_version: u32,
     pub updated_at_unix_ms: u128,
@@ -444,7 +438,7 @@ pub struct StatusSnapshot {
     pub compaction_count: u64,
 }
 
-pub fn run_ingest_with_generator(
+pub(crate) fn run_ingest_with_generator(
     config: &AppConfig,
     paths: &WorkspacePaths,
     generator: &mut dyn KnowledgeGenerator,
@@ -453,7 +447,7 @@ pub fn run_ingest_with_generator(
     run_ingest_with_dependencies(config, paths, generator, &mut fetcher)
 }
 
-pub fn run_ingest_with_dependencies(
+pub(crate) fn run_ingest_with_dependencies(
     config: &AppConfig,
     paths: &WorkspacePaths,
     generator: &mut dyn KnowledgeGenerator,
@@ -504,6 +498,7 @@ pub fn run_ingest_with_dependencies(
     let run_id = new_run_id();
     let candidate_paths = CandidatePaths::new(paths, &run_id);
     candidate_paths.ensure()?;
+    copy_current_source_summaries(paths, &candidate_paths)?;
 
     let mut changed_summaries = Vec::<(ChangedSource, String)>::new();
     for fetched in &fetched_changed {
@@ -525,9 +520,9 @@ pub fn run_ingest_with_dependencies(
     }
 
     let current_knowledge = read_current_knowledge(paths)?;
-    let home = generator.generate_candidate_knowledge(&changed_summaries, &current_knowledge)?;
-    fs::write(candidate_paths.knowledge.join("Home.md"), home)
-        .context("failed to write candidate Home.md")?;
+    let vault_files =
+        generator.generate_candidate_knowledge(&changed_summaries, &current_knowledge)?;
+    write_vault_files(&candidate_paths.knowledge, &vault_files)?;
     write_diff(&candidate_paths, &paths.knowledge_current)?;
 
     let changed_sources = changed_summaries
@@ -566,6 +561,31 @@ pub fn run_ingest_with_dependencies(
     };
     write_status(paths, Some(outcome.clone()), telemetry)?;
     Ok(outcome)
+}
+
+pub fn reorganize(config_path: &Path) -> Result<ReorganizeOutcome> {
+    let config = AppConfig::load_or_default(config_path)?;
+    let paths = WorkspacePaths::from_config(&config);
+    paths.ensure_all()?;
+
+    let run_id = new_run_id();
+    let candidate_paths = CandidatePaths::new(&paths, &run_id);
+    candidate_paths.ensure()?;
+    copy_current_source_summaries(&paths, &candidate_paths)?;
+
+    let current_knowledge = read_current_knowledge(&paths)?;
+    let vault_files = build_reorganized_vault(&current_knowledge, &run_id);
+    write_vault_files(&candidate_paths.knowledge, &vault_files)?;
+    write_diff(&candidate_paths, &paths.knowledge_current)?;
+
+    let metadata = candidate_metadata(run_id.clone(), Vec::new(), PromptCacheStats::default(), 0);
+    write_candidate_metadata(&candidate_paths, &metadata)?;
+
+    Ok(ReorganizeOutcome {
+        run_id,
+        files: vault_files.into_iter().map(|file| file.path).collect(),
+        message: "candidate vault created; review diff before approve".to_string(),
+    })
 }
 
 pub fn run_production_ingest(config_path: &Path) -> Result<IngestOutcome> {
@@ -661,8 +681,11 @@ pub fn list(config_path: &Path) -> Result<Vec<crate::candidates::CandidateMetada
     list_candidates(&paths)
 }
 
-pub fn source_id(url: &str) -> String {
-    source_id_for_url(url)
+fn copy_current_source_summaries(paths: &WorkspacePaths, candidate: &CandidatePaths) -> Result<()> {
+    if !paths.source_summaries_current.exists() {
+        return Ok(());
+    }
+    copy_dir(&paths.source_summaries_current, &candidate.source_summaries)
 }
 
 fn write_status(
@@ -806,13 +829,6 @@ fn write_http_response(
         .context("failed to write response")
 }
 
-fn now_unix_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,11 +862,17 @@ mod tests {
             &mut self,
             changed_summaries: &[(ChangedSource, String)],
             _current_knowledge: &str,
-        ) -> Result<String> {
-            Ok(format!(
-                "# Home\n\n{} changed source(s).",
-                changed_summaries.len()
-            ))
+        ) -> Result<Vec<VaultFile>> {
+            Ok(vec![
+                VaultFile {
+                    path: "index.md".to_string(),
+                    content: "# Index\n\n- [[topics/home|Home]]\n".to_string(),
+                },
+                VaultFile {
+                    path: "topics/home.md".to_string(),
+                    content: format!("# Home\n\n{} changed source(s).", changed_summaries.len()),
+                },
+            ])
         }
 
         fn telemetry(&self) -> GenerationTelemetry {
@@ -903,6 +925,43 @@ mod tests {
             run_ingest_with_dependencies(&cfg, &paths, &mut generator, &mut second_fetcher)
                 .expect("second ingest");
         assert!(matches!(second.kind, IngestOutcomeKind::Unchanged));
+    }
+
+    #[test]
+    fn ingest_candidate_keeps_existing_source_summaries() {
+        let root = unique_temp_dir("wiki-craft-source-summary-copy-test");
+        let cfg = AppConfig {
+            sources: vec![SourceConfig {
+                url: "https://example.test/doc".to_string(),
+                name: Some("local".to_string()),
+                enabled: true,
+                timeout_seconds: 5,
+                max_bytes: 1000,
+            }],
+            runtime: crate::config::RuntimeConfig {
+                root: root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        fs::write(
+            paths.source_summaries_current.join("existing.md"),
+            "# Existing Summary\n",
+        )
+        .expect("existing summary");
+
+        let mut generator = FakeGenerator::new();
+        let mut fetcher = FakeFetcher {
+            outputs: VecDeque::from([fake_fetch_output("https://example.test/doc", "changed")]),
+        };
+        let outcome = run_ingest_with_dependencies(&cfg, &paths, &mut generator, &mut fetcher)
+            .expect("ingest");
+        let run_id = outcome.run_id.expect("candidate run id");
+        let candidate = CandidatePaths::new(&paths, &run_id);
+
+        assert!(candidate.source_summaries.join("existing.md").exists());
     }
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {

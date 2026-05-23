@@ -257,9 +257,11 @@ mod tests {
 
     #[test]
     fn snapshot_computes_cache_rate() {
-        let mut stats = PromptCacheStats::default();
-        stats.total_cache_read_input_tokens = 80;
-        stats.total_cache_creation_input_tokens = 20;
+        let stats = PromptCacheStats {
+            total_cache_read_input_tokens: 80,
+            total_cache_creation_input_tokens: 20,
+            ..Default::default()
+        };
         let snapshot = MetricsSnapshot::from_input(MetricsInput {
             pending_candidates: 1,
             last_run_kind: Some("candidate_created".to_string()),

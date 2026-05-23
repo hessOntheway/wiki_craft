@@ -9,7 +9,7 @@ pub const DEFAULT_RUNTIME_ROOT: &str = ".wiki_craft";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
@@ -27,21 +27,6 @@ pub struct AppConfig {
     pub prompt_cache: PromptCacheConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            sources: Vec::new(),
-            schedule: ScheduleConfig::default(),
-            llm: LlmSettings::default(),
-            audit: AuditConfig::default(),
-            runtime: RuntimeConfig::default(),
-            context_compact: ContextCompactConfig::default(),
-            prompt_cache: PromptCacheConfig::default(),
-            metrics: MetricsConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {
@@ -81,22 +66,22 @@ impl AppConfig {
             .llm
             .api_key
             .clone()
-            .filter(non_empty)
-            .or_else(|| env("LLM_API_KEY").filter(non_empty))
-            .or_else(|| env("DEEPSEEK_API_KEY").filter(non_empty));
+            .filter(|value| non_empty(value))
+            .or_else(|| env("LLM_API_KEY").filter(|value| non_empty(value)))
+            .or_else(|| env("DEEPSEEK_API_KEY").filter(|value| non_empty(value)));
         let base_url = self
             .llm
             .base_url
             .clone()
-            .filter(non_empty)
-            .or_else(|| env("LLM_BASE_URL").filter(non_empty))
+            .filter(|value| non_empty(value))
+            .or_else(|| env("LLM_BASE_URL").filter(|value| non_empty(value)))
             .unwrap_or_else(|| DEFAULT_DEEPSEEK_BASE_URL.to_string());
         let model = self
             .llm
             .model
             .clone()
-            .filter(non_empty)
-            .or_else(|| env("LLM_MODEL").filter(non_empty))
+            .filter(|value| non_empty(value))
+            .or_else(|| env("LLM_MODEL").filter(|value| non_empty(value)))
             .unwrap_or_else(|| DEFAULT_DEEPSEEK_MODEL.to_string());
 
         ResolvedLlmConfig {
@@ -325,7 +310,7 @@ http_bind = "127.0.0.1:9898"
 "#
 }
 
-fn non_empty(value: &String) -> bool {
+fn non_empty(value: &str) -> bool {
     !value.trim().is_empty()
 }
 

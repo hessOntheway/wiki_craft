@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -9,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::knowledge::WorkspacePaths;
 use crate::llm::usage::PromptCacheStats;
 use crate::sources::ChangedSource;
+use crate::support::now_unix_ms;
 
 const CANDIDATE_SCHEMA_VERSION: u32 = 1;
 
@@ -262,7 +262,7 @@ fn replace_dir(from: &Path, to: &Path) -> Result<()> {
         .with_context(|| format!("failed to promote {} to {}", tmp.display(), to.display()))
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     fs::create_dir_all(to).with_context(|| format!("failed to create dir: {}", to.display()))?;
     for entry in walkdir::WalkDir::new(from)
         .into_iter()
@@ -295,13 +295,6 @@ fn validate_run_id(run_id: &str) -> Result<()> {
         bail!("invalid run_id: {run_id}");
     }
     Ok(())
-}
-
-fn now_unix_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
