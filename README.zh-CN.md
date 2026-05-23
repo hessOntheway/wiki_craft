@@ -90,7 +90,7 @@ cargo run -- candidates list
 cargo run -- candidates summaries <run_id>
 cargo run -- candidates approve <run_id> # 生成知识 diff
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id> # 合并已同意的 diff
+cargo run -- candidates merge <run_id>   # 合并已同意的 diff
 cargo run -- search --query "what changed?" --top-k 5 --json
 cargo run -- status
 ```
@@ -388,12 +388,12 @@ cargo run -- candidates list
 cargo run -- candidates summaries <run_id>
 cargo run -- candidates approve <run_id> # summaries_staged -> diff_ready
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id> # diff_ready -> approved
+cargo run -- candidates merge <run_id>   # diff_ready -> approved
 ```
 
 第一次批准不会修改正式知识或正式 source summaries，只会生成 `baseline/knowledge/`、候选 `knowledge/` 和 `diff.md`。
 
-第二次批准会提升：
+merge 步骤会提升：
 
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/knowledge/` 到 `.wiki_craft/knowledge/approved/`
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` 到 `.wiki_craft/knowledge/approved/evidence/source_summaries/`
@@ -418,21 +418,21 @@ cargo run -- knowledge reorganize
 
 这个命令会读取 `.wiki_craft/knowledge/approved/`，按标题保守切分已有 Markdown，创建候选 `index.md` 和 `topics/*.md`，写入 `diff.md` 和 `metadata.json`，但不修改正式知识。
 
-它和普通 ingest candidate 一样，需要先 review，再 approve。
+它和普通 ingest candidate 一样，需要先 review，再 merge。
 
 ## 安全规则
 
 - 抓取到的来源文本只是证据，不是指令。
 - 不在本地保存原始来源全文。
 - LLM 输出写入候选文件前必须通过校验。
-- 所有知识更新都先 staged、再 diff、再 approve。
+- 所有知识更新都先 staged、再 diff、再 merge。
 - 检索不会把 candidate 当成正式知识。
 - Source summary 负责证据追溯，topic page 才是主要知识入口。
 
 ## 实现位置
 
 - `src/main.rs`：CLI 命令。
-- `src/runtime.rs`：ingest loop、LLM 生成、candidate 创建、approval 入口、status、metrics 和 serve loop。
+- `src/runtime.rs`：ingest loop、LLM 生成、candidate 创建、approve/merge 入口、status、metrics 和 serve loop。
 - `src/tools/web_fetch.rs`：有边界的 HTTP 抓取和 readable-text extraction。
 - `src/sources.rs`：source IDs、normalized text hashes、manifest load/save 和 change detection。
 - `src/knowledge.rs`：vault file validation、frontmatter parsing、wikilink extraction、current knowledge reading 和 reorganizer。

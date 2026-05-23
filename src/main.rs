@@ -62,6 +62,7 @@ enum CandidateCommand {
     Diff { run_id: String },
     Summaries { run_id: String },
     Approve { run_id: String },
+    Merge { run_id: String },
     Reject { run_id: String },
 }
 
@@ -138,6 +139,10 @@ fn main() -> Result<()> {
             }
             CandidateCommand::Approve { run_id } => {
                 let outcome = runtime::approve(&cli.config, &run_id)?;
+                println!("{}", outcome.message);
+            }
+            CandidateCommand::Merge { run_id } => {
+                let outcome = runtime::merge(&cli.config, &run_id)?;
                 println!("{}", outcome.message);
             }
             CandidateCommand::Reject { run_id } => {

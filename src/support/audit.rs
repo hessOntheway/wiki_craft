@@ -45,6 +45,12 @@ pub enum AuditEvent {
         estimated_tokens_before: usize,
         transcript_path: Option<String>,
     },
+    CandidateError {
+        ts_unix_ms: u128,
+        run_id: String,
+        stage: String,
+        error: String,
+    },
 }
 
 pub fn append_event(path: &str, event: &AuditEvent) -> Result<()> {
@@ -120,6 +126,15 @@ pub fn compaction_event(
         removed_messages,
         estimated_tokens_before,
         transcript_path,
+    }
+}
+
+pub fn candidate_error_event(run_id: String, stage: String, error: String) -> AuditEvent {
+    AuditEvent::CandidateError {
+        ts_unix_ms: now_unix_ms(),
+        run_id,
+        stage,
+        error,
     }
 }
 

@@ -24,6 +24,7 @@ pub struct ChatCompletionResult {
     pub message: Value,
     pub usage: ModelUsage,
     pub cached: bool,
+    pub finish_reason: Option<String>,
 }
 
 struct AuditExchange<'a> {
@@ -129,7 +130,7 @@ impl OpenAiCompatClient {
 
         let request_hash = request_hash_hex(&body);
         if let Some(cache) = &self.cache
-            && let Some(cached) = cache.lookup(&request_hash)?
+            && let Some(cached) = cache.lookup(&request_hash, self.cfg.max_tokens)?
         {
             eprintln!("info: local prompt cache hit");
             self.write_audit_event(AuditExchange {
@@ -169,13 +170,19 @@ impl OpenAiCompatClient {
         let payload: Value = response
             .json()
             .context("failed to decode model api response")?;
-        let message = payload
+        let choice = payload
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
+            .context("model response missing choices[0]")?;
+        let message = choice
+            .get("message")
             .cloned()
             .context("model response missing choices[0].message")?;
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         let usage = payload
             .get("usage")
             .cloned()
@@ -187,6 +194,7 @@ impl OpenAiCompatClient {
             message: message.clone(),
             usage: usage.clone(),
             cached: false,
+            finish_reason: finish_reason.clone(),
         };
         self.write_audit_event(AuditExchange {
             request_hash: &request_hash,
@@ -197,6 +205,9 @@ impl OpenAiCompatClient {
             usage: &usage,
             audit_log_path_override,
         });
+        if finish_reason.as_deref() == Some("length") {
+            bail_truncated_output(self.cfg.max_tokens)?;
+        }
         if let Some(cache) = &self.cache
             && let Err(error) = cache.store(&request_hash, &result)
         {
@@ -224,6 +235,26 @@ impl OpenAiCompatClient {
         if let Err(error) = append_event(path, &event) {
             eprintln!("warn: failed to append llm audit event: {error}");
         }
+    }
+}
+
+fn bail_truncated_output(max_tokens: u32) -> Result<()> {
+    bail!(
+        "model output was truncated by llm.max_tokens={} before a complete response was produced; increase [llm].max_tokens or reduce the candidate vault output size",
+        max_tokens
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_output_error_mentions_max_tokens() {
+        let error = bail_truncated_output(4096)
+            .expect_err("length finish reason should fail")
+            .to_string();
+        assert!(error.contains("model output was truncated by llm.max_tokens=4096"));
     }
 }
 

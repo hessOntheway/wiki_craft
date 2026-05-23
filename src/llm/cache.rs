@@ -20,6 +20,8 @@ struct PromptCacheEntry {
     created_at_unix_ms: u128,
     message: Value,
     usage: ModelUsage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 impl PromptCache {
@@ -30,7 +32,7 @@ impl PromptCache {
         Ok(Self { dir })
     }
 
-    pub fn lookup(&self, key: &str) -> Result<Option<ChatCompletionResult>> {
+    pub fn lookup(&self, key: &str, max_tokens: u32) -> Result<Option<ChatCompletionResult>> {
         let path = self.entry_path(key);
         if !path.exists() {
             return Ok(None);
@@ -42,10 +44,29 @@ impl PromptCache {
             .with_context(|| format!("failed to read prompt cache entry: {}", path.display()))?;
         let entry: PromptCacheEntry = serde_json::from_str(&contents)
             .with_context(|| format!("failed to parse prompt cache entry: {}", path.display()))?;
+        if entry.finish_reason.as_deref() == Some("length") {
+            eprintln!(
+                "info: ignoring truncated prompt cache entry: {}",
+                path.display()
+            );
+            return Ok(None);
+        }
+        let max_tokens = u64::from(max_tokens);
+        if max_tokens > 0
+            && (entry.usage.completion_tokens >= max_tokens
+                || entry.usage.output_tokens >= max_tokens)
+        {
+            eprintln!(
+                "info: ignoring prompt cache entry at max_tokens limit: {}",
+                path.display()
+            );
+            return Ok(None);
+        }
         Ok(Some(ChatCompletionResult {
             message: entry.message,
             usage: entry.usage,
             cached: true,
+            finish_reason: entry.finish_reason,
         }))
     }
 
@@ -57,6 +78,7 @@ impl PromptCache {
                 .as_millis(),
             message: response.message.clone(),
             usage: response.usage.clone(),
+            finish_reason: response.finish_reason.clone(),
         };
         let path = self.entry_path(key);
         let tmp_path = path.with_extension("json.tmp");
@@ -115,12 +137,65 @@ mod tests {
                 ..Default::default()
             },
             cached: false,
+            finish_reason: None,
         };
         cache.store("abc", &response).expect("store");
-        let loaded = cache.lookup("abc").expect("lookup").expect("hit");
+        let loaded = cache.lookup("abc", 100).expect("lookup").expect("hit");
         assert!(loaded.cached);
         assert_eq!(loaded.message, response.message);
         assert_eq!(loaded.usage.input_tokens, 10);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prompt_cache_ignores_entries_at_max_tokens_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "wiki-craft-prompt-cache-limit-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let cache = PromptCache::new(&dir).expect("create cache");
+        let response = ChatCompletionResult {
+            message: json!({"role": "assistant", "content": "truncated"}),
+            usage: ModelUsage {
+                completion_tokens: 4096,
+                ..Default::default()
+            },
+            cached: false,
+            finish_reason: None,
+        };
+        cache.store("abc", &response).expect("store");
+
+        assert!(cache.lookup("abc", 4096).expect("lookup").is_none());
+        let loaded = cache.lookup("abc", 8192).expect("lookup").expect("hit");
+        assert_eq!(loaded.message, response.message);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prompt_cache_ignores_length_finish_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "wiki-craft-prompt-cache-finish-reason-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let cache = PromptCache::new(&dir).expect("create cache");
+        let response = ChatCompletionResult {
+            message: json!({"role": "assistant", "content": "truncated"}),
+            usage: ModelUsage {
+                completion_tokens: 10,
+                ..Default::default()
+            },
+            cached: false,
+            finish_reason: Some("length".to_string()),
+        };
+        cache.store("abc", &response).expect("store");
+
+        assert!(cache.lookup("abc", 4096).expect("lookup").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

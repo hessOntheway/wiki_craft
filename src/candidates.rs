@@ -222,11 +222,68 @@ pub fn mark_diff_ready(
     write_candidate_metadata(&candidate_paths, &metadata)
 }
 
-pub fn approve_candidate(paths: &WorkspacePaths, run_id: &str) -> Result<()> {
+pub fn set_candidate_status(
+    paths: &WorkspacePaths,
+    run_id: &str,
+    status: CandidateStatus,
+) -> Result<()> {
+    validate_run_id(run_id)?;
+    let candidate_paths = CandidatePaths::new(paths, run_id);
+    let mut metadata = load_candidate_metadata(paths, run_id)?;
+    metadata.status = status;
+    write_candidate_metadata(&candidate_paths, &metadata)
+}
+
+pub fn clean_candidate_generated_outputs(paths: &WorkspacePaths, run_id: &str) -> Result<()> {
+    validate_run_id(run_id)?;
+    let candidate_paths = CandidatePaths::new(paths, run_id);
+    remove_path_if_exists(&candidate_paths.baseline_knowledge)?;
+    remove_path_if_exists(&candidate_paths.knowledge)?;
+    remove_path_if_exists(&candidate_paths.diff)?;
+    Ok(())
+}
+
+pub fn create_merge_backup(paths: &WorkspacePaths, run_id: &str) -> Result<PathBuf> {
+    validate_run_id(run_id)?;
+    let candidate_paths = CandidatePaths::new(paths, run_id);
+    let backup = candidate_paths
+        .root
+        .join(format!("merge_backup_{}", now_unix_ms()));
+    copy_dir(&paths.knowledge_current, &backup)?;
+    Ok(backup)
+}
+
+pub fn restore_merge_backup(paths: &WorkspacePaths, backup: &Path) -> Result<()> {
+    if paths.knowledge_current.exists() {
+        fs::remove_dir_all(&paths.knowledge_current).with_context(|| {
+            format!(
+                "failed to remove current knowledge before rollback: {}",
+                paths.knowledge_current.display()
+            )
+        })?;
+    }
+    copy_dir(backup, &paths.knowledge_current)
+}
+
+pub fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove dir: {}", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove file: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub fn merge_candidate(paths: &WorkspacePaths, run_id: &str) -> Result<()> {
     validate_run_id(run_id)?;
     let metadata = load_candidate_metadata(paths, run_id)?;
     if metadata.status != CandidateStatus::DiffReady {
-        bail!("candidate {run_id} is not ready to merge; approve staged summaries first");
+        bail!("candidate {run_id} is not ready to merge; run `candidates approve {run_id}` first");
     }
     let candidate_paths = CandidatePaths::new(paths, run_id);
     if !candidate_paths.knowledge.exists() {
@@ -410,7 +467,7 @@ mod tests {
         metadata.status = CandidateStatus::DiffReady;
         write_candidate_metadata(&candidate, &metadata).expect("metadata");
 
-        approve_candidate(&paths, run_id).expect("approve");
+        merge_candidate(&paths, run_id).expect("merge");
 
         let current =
             fs::read_to_string(paths.knowledge_current.join("Home.md")).expect("current home");

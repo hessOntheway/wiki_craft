@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::candidates::{
-    CandidatePaths, CandidateStatus, approve_candidate, candidate_metadata, copy_dir,
-    list_candidates, load_candidate_metadata, mark_diff_ready, new_run_id,
-    read_changed_source_summaries, read_diff, remove_candidate, write_baseline_diff,
+    CandidatePaths, CandidateStatus, candidate_metadata, clean_candidate_generated_outputs,
+    copy_dir, create_merge_backup, list_candidates, load_candidate_metadata, mark_diff_ready,
+    merge_candidate, new_run_id, read_changed_source_summaries, read_diff, remove_candidate,
+    remove_path_if_exists, restore_merge_backup, set_candidate_status, write_baseline_diff,
     write_candidate_metadata,
 };
 use crate::config::AppConfig;
@@ -28,7 +29,9 @@ use crate::llm::usage::PromptCacheStats;
 use crate::sources::{
     ChangedSource, FetchedSource, SourceManifest, fetched_from_output, source_id_for_url,
 };
-use crate::support::audit::{append_event, compaction_event, tool_call_event, tool_result_event};
+use crate::support::audit::{
+    append_event, candidate_error_event, compaction_event, tool_call_event, tool_result_event,
+};
 use crate::support::compact::{auto_compact_if_needed, remove_orphan_tool_messages};
 use crate::support::metrics::{
     MetricsInput, MetricsSnapshot, read_metrics, render_prometheus, write_metrics,
@@ -365,6 +368,8 @@ Return only JSON, with this exact shape:
 The candidate knowledge base is an Obsidian-style vault:
 - index.md is the entry point and links to topic pages.
 - topic pages live under topics/*.md.
+- return only index.md and topics/*.md files; do not return evidence/source_summaries files.
+- source summaries are copied by Wiki Craft runtime during merge, not by this JSON payload.
 - every file must be Markdown with YAML frontmatter containing title, aliases, tags, source_ids, source_urls, version_hashes, and updated_at_run_id.
 - organize by topic first, not by source.
 - use wikilinks between related topics.
@@ -805,6 +810,12 @@ pub fn approve(config_path: &Path, run_id: &str) -> Result<ApproveOutcome> {
     approve_with_generator(&paths, run_id, &mut generator)
 }
 
+pub fn merge(config_path: &Path, run_id: &str) -> Result<ApproveOutcome> {
+    let config = AppConfig::load_or_default(config_path)?;
+    let paths = WorkspacePaths::from_config(&config);
+    merge_with_paths(&paths, run_id)
+}
+
 pub(crate) fn approve_with_generator(
     paths: &WorkspacePaths,
     run_id: &str,
@@ -813,12 +824,33 @@ pub(crate) fn approve_with_generator(
     let metadata = load_candidate_metadata(paths, run_id)?;
     match metadata.status {
         CandidateStatus::SummariesStaged => approve_summaries(paths, run_id, generator),
-        CandidateStatus::DiffReady => approve_diff(paths, run_id, metadata),
+        CandidateStatus::DiffReady => bail!(
+            "candidate {run_id} already has a knowledge diff; review it with `candidates diff {run_id}`, then run `candidates merge {run_id}`"
+        ),
         CandidateStatus::Approved => bail!("candidate {run_id} has already been approved"),
     }
 }
 
 fn approve_summaries(
+    paths: &WorkspacePaths,
+    run_id: &str,
+    generator: &mut dyn KnowledgeGenerator,
+) -> Result<ApproveOutcome> {
+    match approve_summaries_inner(paths, run_id, generator) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if let Err(cleanup_error) = clean_candidate_generated_outputs(paths, run_id) {
+                eprintln!(
+                    "warn: failed to clean generated candidate outputs for {run_id}: {cleanup_error:#}"
+                );
+            }
+            log_candidate_error(paths, run_id, "approve", &error);
+            Err(error)
+        }
+    }
+}
+
+fn approve_summaries_inner(
     paths: &WorkspacePaths,
     run_id: &str,
     generator: &mut dyn KnowledgeGenerator,
@@ -852,35 +884,70 @@ fn approve_summaries(
     Ok(ApproveOutcome {
         run_id: run_id.to_string(),
         status: CandidateStatus::DiffReady,
-        message:
-            "candidate summaries approved; review generated knowledge diff before final approve"
-                .to_string(),
+        message: "candidate summaries approved; review generated knowledge diff before merge"
+            .to_string(),
     })
 }
 
-fn approve_diff(
+fn merge_with_paths(paths: &WorkspacePaths, run_id: &str) -> Result<ApproveOutcome> {
+    let metadata = load_candidate_metadata(paths, run_id)?;
+    match metadata.status {
+        CandidateStatus::SummariesStaged => bail!(
+            "candidate {run_id} has no knowledge diff yet; run `candidates approve {run_id}` first"
+        ),
+        CandidateStatus::DiffReady => merge_diff(paths, run_id, metadata),
+        CandidateStatus::Approved => bail!("candidate {run_id} has already been approved"),
+    }
+}
+
+fn merge_diff(
     paths: &WorkspacePaths,
     run_id: &str,
     metadata: crate::candidates::CandidateMetadata,
 ) -> Result<ApproveOutcome> {
-    approve_candidate(paths, run_id)?;
-    let mut manifest = SourceManifest::load(&paths.manifest_path)?;
-    for changed in metadata.changed_sources {
-        let summary_path = paths
-            .source_summaries_current
-            .join(format!("{}.md", changed.source_id))
-            .display()
-            .to_string();
-        manifest.upsert_approved_changed(&changed, run_id, summary_path);
+    let backup = create_merge_backup(paths, run_id)?;
+    let merge_result = merge_candidate(paths, run_id).and_then(|_| {
+        let mut manifest = SourceManifest::load(&paths.manifest_path)?;
+        for changed in metadata.changed_sources {
+            let summary_path = paths
+                .source_summaries_current
+                .join(format!("{}.md", changed.source_id))
+                .display()
+                .to_string();
+            manifest.upsert_approved_changed(&changed, run_id, summary_path);
+        }
+        manifest.save(&paths.manifest_path)
+    });
+    if let Err(error) = merge_result {
+        if let Err(rollback_error) = restore_merge_backup(paths, &backup) {
+            eprintln!(
+                "warn: failed to rollback approved knowledge for {run_id}: {rollback_error:#}"
+            );
+        }
+        if let Err(status_error) = set_candidate_status(paths, run_id, CandidateStatus::DiffReady) {
+            eprintln!("warn: failed to restore candidate status for {run_id}: {status_error:#}");
+        }
+        if let Err(cleanup_error) = remove_path_if_exists(&backup) {
+            eprintln!("warn: failed to remove merge backup for {run_id}: {cleanup_error:#}");
+        }
+        log_candidate_error(paths, run_id, "merge", &error);
+        return Err(error);
     }
-    manifest.save(&paths.manifest_path)?;
-    write_status(&paths, None, GenerationTelemetry::default())?;
+    remove_path_if_exists(&backup)?;
+    write_status(paths, None, GenerationTelemetry::default())?;
     remove_candidate(paths, run_id)?;
     Ok(ApproveOutcome {
         run_id: run_id.to_string(),
         status: CandidateStatus::Approved,
-        message: "candidate knowledge diff approved and merged".to_string(),
+        message: "candidate knowledge diff merged into approved knowledge".to_string(),
     })
+}
+
+fn log_candidate_error(paths: &WorkspacePaths, run_id: &str, stage: &str, error: &anyhow::Error) {
+    let event = candidate_error_event(run_id.to_string(), stage.to_string(), format!("{error:#}"));
+    if let Err(audit_error) = append_event(&paths.audit_events_path.display().to_string(), &event) {
+        eprintln!("warn: failed to append candidate error audit event: {audit_error}");
+    }
 }
 
 pub fn list(config_path: &Path) -> Result<Vec<crate::candidates::CandidateMetadata>> {
@@ -916,7 +983,29 @@ fn copy_current_knowledge_to_baseline(
             )
         })?;
     }
-    copy_dir(&paths.knowledge_current, &candidate.baseline_knowledge)
+    fs::create_dir_all(&candidate.baseline_knowledge).with_context(|| {
+        format!(
+            "failed to create candidate baseline: {}",
+            candidate.baseline_knowledge.display()
+        )
+    })?;
+    let index_path = paths.knowledge_current.join("index.md");
+    if index_path.exists() {
+        fs::copy(&index_path, candidate.baseline_knowledge.join("index.md")).with_context(
+            || {
+                format!(
+                    "failed to copy {} to {}",
+                    index_path.display(),
+                    candidate.baseline_knowledge.join("index.md").display()
+                )
+            },
+        )?;
+    }
+    let topics_path = paths.knowledge_current.join("topics");
+    if topics_path.exists() {
+        copy_dir(&topics_path, &candidate.baseline_knowledge.join("topics"))?;
+    }
+    Ok(())
 }
 
 fn load_changed_summaries(
@@ -1100,12 +1189,21 @@ mod tests {
 
     struct FakeGenerator {
         calls: AtomicUsize,
+        fail_candidate_generation: bool,
     }
 
     impl FakeGenerator {
         fn new() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                fail_candidate_generation: false,
+            }
+        }
+
+        fn failing_candidate_generation() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail_candidate_generation: true,
             }
         }
     }
@@ -1124,6 +1222,9 @@ mod tests {
             changed_summaries: &[(ChangedSource, String)],
             _current_knowledge: &str,
         ) -> Result<Vec<VaultFile>> {
+            if self.fail_candidate_generation {
+                bail!("fake candidate generation failed");
+            }
             Ok(vec![
                 VaultFile {
                     path: "index.md".to_string(),
@@ -1261,6 +1362,11 @@ mod tests {
         let paths = WorkspacePaths::from_config(&cfg);
         paths.ensure_all().expect("workspace dirs");
         fs::write(paths.knowledge_current.join("index.md"), "# Current\n").expect("current index");
+        fs::write(
+            paths.source_summaries_current.join("existing.md"),
+            "# Existing\n",
+        )
+        .expect("existing summary");
 
         let run_id = "run_first_approve_test";
         let candidate = CandidatePaths::new(&paths, run_id);
@@ -1289,10 +1395,89 @@ mod tests {
                 .expect("baseline index"),
             "# Current\n"
         );
+        assert!(!candidate.baseline_knowledge.join("evidence").exists());
         assert!(candidate.knowledge.join("index.md").exists());
         assert!(candidate.diff.exists());
         let metadata = load_candidate_metadata(&paths, run_id).expect("metadata");
         assert_eq!(metadata.status, CandidateStatus::DiffReady);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approve_failure_cleans_generated_outputs_but_keeps_summaries() {
+        let root = unique_temp_dir("wiki-craft-approve-failure-test");
+        let cfg = AppConfig {
+            runtime: crate::config::RuntimeConfig {
+                root: root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        fs::write(paths.knowledge_current.join("index.md"), "# Current\n").expect("current index");
+
+        let run_id = "run_approve_failure_test";
+        let candidate = CandidatePaths::new(&paths, run_id);
+        candidate.ensure().expect("candidate dirs");
+        fs::write(candidate.source_summaries.join("source.md"), "# Summary\n")
+            .expect("candidate summary");
+        let metadata = candidate_metadata(
+            run_id.to_string(),
+            vec![test_changed_source()],
+            PromptCacheStats::default(),
+            0,
+        );
+        write_candidate_metadata(&candidate, &metadata).expect("metadata");
+
+        let mut generator = FakeGenerator::failing_candidate_generation();
+        let error = approve_with_generator(&paths, run_id, &mut generator)
+            .expect_err("approve should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fake candidate generation failed")
+        );
+        assert!(candidate.source_summaries.join("source.md").exists());
+        assert!(candidate.metadata.exists());
+        assert!(!candidate.baseline_knowledge.exists());
+        assert!(!candidate.knowledge.exists());
+        assert!(!candidate.diff.exists());
+        let metadata = load_candidate_metadata(&paths, run_id).expect("metadata");
+        assert_eq!(metadata.status, CandidateStatus::SummariesStaged);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approve_rejects_diff_ready_candidates() {
+        let root = unique_temp_dir("wiki-craft-approve-diff-ready-test");
+        let cfg = AppConfig {
+            runtime: crate::config::RuntimeConfig {
+                root: root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        let run_id = "run_approve_diff_ready_test";
+        let candidate = CandidatePaths::new(&paths, run_id);
+        candidate.ensure().expect("candidate dirs");
+        let mut metadata = candidate_metadata(
+            run_id.to_string(),
+            vec![test_changed_source()],
+            PromptCacheStats::default(),
+            0,
+        );
+        metadata.status = CandidateStatus::DiffReady;
+        write_candidate_metadata(&candidate, &metadata).expect("metadata");
+
+        let mut generator = FakeGenerator::new();
+        let error = approve_with_generator(&paths, run_id, &mut generator)
+            .expect_err("approve should reject diff-ready candidates");
+
+        assert!(error.to_string().contains("candidates merge"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1358,8 +1543,8 @@ mod tests {
     }
 
     #[test]
-    fn approve_removes_candidate_dir_after_success() {
-        let root = unique_temp_dir("wiki-craft-runtime-approve-test");
+    fn merge_removes_candidate_dir_after_success() {
+        let root = unique_temp_dir("wiki-craft-runtime-merge-test");
         fs::create_dir_all(&root).expect("test root");
         let workspace_root = root.join(".wiki_craft");
         let config_path = root.join("wiki_craft.toml");
@@ -1402,7 +1587,7 @@ mod tests {
         metadata.status = CandidateStatus::DiffReady;
         write_candidate_metadata(&candidate, &metadata).expect("metadata");
 
-        let outcome = approve(&config_path, run_id).expect("approve");
+        let outcome = merge(&config_path, run_id).expect("merge");
 
         assert_eq!(outcome.status, CandidateStatus::Approved);
         assert_eq!(
@@ -1430,6 +1615,108 @@ mod tests {
                 .ends_with(".wiki_craft/knowledge/approved/evidence/source_summaries/source.md")
         );
         assert!(!candidate.root.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merge_rejects_summaries_staged_candidates() {
+        let root = unique_temp_dir("wiki-craft-merge-staged-test");
+        fs::create_dir_all(&root).expect("test root");
+        let workspace_root = root.join(".wiki_craft");
+        let config_path = root.join("wiki_craft.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[runtime]\nroot = \"{}\"\nmax_steps = 4\n",
+                workspace_root.display()
+            ),
+        )
+        .expect("config");
+
+        let cfg = AppConfig {
+            runtime: crate::config::RuntimeConfig {
+                root: workspace_root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        let run_id = "run_merge_staged_test";
+        let candidate = CandidatePaths::new(&paths, run_id);
+        candidate.ensure().expect("candidate dirs");
+        let metadata = candidate_metadata(
+            run_id.to_string(),
+            vec![test_changed_source()],
+            PromptCacheStats::default(),
+            0,
+        );
+        write_candidate_metadata(&candidate, &metadata).expect("metadata");
+
+        let error = merge(&config_path, run_id).expect_err("merge should reject staged candidate");
+
+        assert!(error.to_string().contains("candidates approve"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merge_failure_rolls_back_approved_knowledge_and_keeps_candidate_diff_ready() {
+        let root = unique_temp_dir("wiki-craft-merge-rollback-test");
+        fs::create_dir_all(&root).expect("test root");
+        let workspace_root = root.join(".wiki_craft");
+        let config_path = root.join("wiki_craft.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[runtime]\nroot = \"{}\"\nmax_steps = 4\n",
+                workspace_root.display()
+            ),
+        )
+        .expect("config");
+
+        let cfg = AppConfig {
+            runtime: crate::config::RuntimeConfig {
+                root: workspace_root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        paths.ensure_all().expect("workspace dirs");
+        fs::write(paths.knowledge_current.join("index.md"), "# Current\n").expect("current index");
+        fs::create_dir_all(&paths.manifest_path).expect("manifest path as dir");
+
+        let run_id = "run_merge_rollback_test";
+        let candidate = CandidatePaths::new(&paths, run_id);
+        candidate.ensure().expect("candidate dirs");
+        fs::create_dir_all(&candidate.knowledge).expect("candidate knowledge dir");
+        fs::write(candidate.knowledge.join("index.md"), "# Candidate\n").expect("candidate index");
+        fs::write(candidate.source_summaries.join("source.md"), "# Summary\n")
+            .expect("candidate summary");
+        fs::write(&candidate.diff, "# Diff\n").expect("diff");
+        let mut metadata = candidate_metadata(
+            run_id.to_string(),
+            vec![test_changed_source()],
+            PromptCacheStats::default(),
+            0,
+        );
+        metadata.status = CandidateStatus::DiffReady;
+        write_candidate_metadata(&candidate, &metadata).expect("metadata");
+
+        let error = merge(&config_path, run_id).expect_err("merge should fail");
+
+        assert!(
+            error.to_string().contains("failed to read source manifest")
+                || error.to_string().contains("Is a directory")
+        );
+        assert_eq!(
+            fs::read_to_string(paths.knowledge_current.join("index.md")).expect("current index"),
+            "# Current\n"
+        );
+        assert!(candidate.knowledge.join("index.md").exists());
+        assert!(candidate.diff.exists());
+        let metadata = load_candidate_metadata(&paths, run_id).expect("metadata");
+        assert_eq!(metadata.status, CandidateStatus::DiffReady);
         let _ = fs::remove_dir_all(root);
     }
 

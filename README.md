@@ -91,7 +91,7 @@ cargo run -- candidates list
 cargo run -- candidates summaries <run_id>
 cargo run -- candidates approve <run_id> # generate knowledge diff
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id> # merge accepted diff
+cargo run -- candidates merge <run_id>   # merge accepted diff
 cargo run -- search --query "what changed?" --top-k 5 --json
 cargo run -- status
 ```
@@ -316,7 +316,7 @@ The generated summary is written to:
 .wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/{source_id}.md
 ```
 
-Ingest writes only the changed source summaries into the candidate. Final approval merges those changed summaries into the approved source-summary directory, preserving already approved summaries that were not part of the candidate.
+Ingest writes only the changed source summaries into the candidate. Final merge copies those changed summaries into the approved source-summary directory, preserving already approved summaries that were not part of the candidate.
 
 ### Candidate Knowledge
 
@@ -389,12 +389,12 @@ cargo run -- candidates list
 cargo run -- candidates summaries <run_id>
 cargo run -- candidates approve <run_id> # summaries_staged -> diff_ready
 cargo run -- candidates diff <run_id>
-cargo run -- candidates approve <run_id> # diff_ready -> approved
+cargo run -- candidates merge <run_id>   # diff_ready -> approved
 ```
 
 The first approval does not modify approved knowledge or approved source summaries. It only generates `baseline/knowledge/`, proposed `knowledge/`, and `diff.md`.
 
-The second approval promotes:
+The merge step promotes:
 
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/knowledge/` to `.wiki_craft/knowledge/approved/`
 - `.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` to `.wiki_craft/knowledge/approved/evidence/source_summaries/`
@@ -405,9 +405,9 @@ Rejecting a candidate is also explicit:
 cargo run -- candidates reject <run_id>
 ```
 
-Because final approval replaces the approved topic/index vault, every proposed knowledge vault must be complete. Source summaries are merged by file, so staging only needs to contain the changed summaries for that run.
+Because merge replaces the approved topic/index vault, every proposed knowledge vault must be complete. Source summaries are merged by file, so staging only needs to contain the changed summaries for that run.
 
-After approval, manifest summary paths are updated to point at the approved source-summary location, and the approved candidate directory is removed from staging.
+After merge, manifest summary paths are updated to point at the approved source-summary location, and the approved candidate directory is removed from staging.
 
 ## Reorganizing Existing Knowledge
 
@@ -419,7 +419,7 @@ cargo run -- knowledge reorganize
 
 This command reads `.wiki_craft/knowledge/approved/`, splits existing Markdown conservatively by headings, creates candidate `index.md` and `topics/*.md`, writes `diff.md` and `metadata.json`, and leaves approved knowledge unchanged.
 
-Review and approve it like any ingest candidate.
+Review and merge it like any ingest candidate.
 
 ## Safety Rules
 
@@ -433,7 +433,7 @@ Review and approve it like any ingest candidate.
 ## Implementation Map
 
 - `src/main.rs`: CLI commands.
-- `src/runtime.rs`: ingest loop, LLM generation, candidate creation, approval entry points, status, metrics, and serve loop.
+- `src/runtime.rs`: ingest loop, LLM generation, candidate creation, approve/merge entry points, status, metrics, and serve loop.
 - `src/tools/web_fetch.rs`: bounded HTTP fetch and readable-text extraction.
 - `src/sources.rs`: source IDs, normalized text hashes, manifest load/save, and change detection.
 - `src/knowledge.rs`: vault file validation, frontmatter parsing, wikilink extraction, current knowledge reading, and reorganizer.
