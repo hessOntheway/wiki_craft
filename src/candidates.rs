@@ -45,7 +45,7 @@ impl CandidatePaths {
     pub fn new(paths: &WorkspacePaths, run_id: &str) -> Self {
         let root = paths.candidates_dir.join(run_id);
         Self {
-            source_summaries: root.join("source_summaries"),
+            source_summaries: root.join("evidence").join("source_summaries"),
             knowledge: root.join("knowledge"),
             diff: root.join("diff.md"),
             metadata: root.join("metadata.json"),

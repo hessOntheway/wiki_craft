@@ -582,25 +582,28 @@ mod tests {
     #[test]
     fn searches_only_approved_current_vault_dirs() {
         let root = unique_temp_dir();
-        fs::create_dir_all(root.join(".wiki_craft/knowledge/current/topics")).unwrap();
-        fs::create_dir_all(root.join(".wiki_craft/candidates/run_1/knowledge/topics")).unwrap();
+        fs::create_dir_all(root.join(".wiki_craft/knowledge/approved/topics")).unwrap();
+        fs::create_dir_all(
+            root.join(".wiki_craft/knowledge/staging/candidates/run_1/knowledge/topics"),
+        )
+        .unwrap();
         fs::write(
             root.join("wiki_craft.toml"),
             "[runtime]\nroot = \".wiki_craft\"\n",
         )
         .unwrap();
         fs::write(
-            root.join(".wiki_craft/knowledge/current/index.md"),
+            root.join(".wiki_craft/knowledge/approved/index.md"),
             "# Index\n\n- [[topics/home|Home]]",
         )
         .unwrap();
         fs::write(
-            root.join(".wiki_craft/knowledge/current/topics/home.md"),
+            root.join(".wiki_craft/knowledge/approved/topics/home.md"),
             "---\ntitle: \"Retrieval\"\naliases: [lookup]\ntags: [memory]\nsource_ids: []\nsource_urls: []\nversion_hashes: []\n---\n\n# Retrieval\nstable llama retrieval",
         )
         .unwrap();
         fs::write(
-            root.join(".wiki_craft/candidates/run_1/knowledge/topics/draft.md"),
+            root.join(".wiki_craft/knowledge/staging/candidates/run_1/knowledge/topics/draft.md"),
             "# Candidate\nsecret draft term",
         )
         .unwrap();
@@ -618,7 +621,7 @@ mod tests {
         assert!(
             response.results[0]
                 .path
-                .ends_with(".wiki_craft/knowledge/current/topics/home.md")
+                .ends_with(".wiki_craft/knowledge/approved/topics/home.md")
         );
 
         let draft_response = search_configured(
@@ -637,25 +640,26 @@ mod tests {
     #[test]
     fn topic_metadata_can_beat_source_summary_body_match() {
         let root = unique_temp_dir();
-        fs::create_dir_all(root.join(".wiki_craft/knowledge/current/topics")).unwrap();
-        fs::create_dir_all(root.join(".wiki_craft/source_summaries/current")).unwrap();
+        fs::create_dir_all(root.join(".wiki_craft/knowledge/approved/topics")).unwrap();
+        fs::create_dir_all(root.join(".wiki_craft/knowledge/approved/evidence/source_summaries"))
+            .unwrap();
         fs::write(
             root.join("wiki_craft.toml"),
             "[runtime]\nroot = \".wiki_craft\"\n",
         )
         .unwrap();
         fs::write(
-            root.join(".wiki_craft/knowledge/current/index.md"),
+            root.join(".wiki_craft/knowledge/approved/index.md"),
             "# Index",
         )
         .unwrap();
         fs::write(
-            root.join(".wiki_craft/knowledge/current/topics/search.md"),
+            root.join(".wiki_craft/knowledge/approved/topics/search.md"),
             "---\ntitle: \"Search\"\naliases: [retrieval]\ntags: [lookup]\nsource_ids: [s1]\nsource_urls: [https://example.test]\nversion_hashes: [abcdef1234567890]\n---\n\n# Search\nShort note.",
         )
         .unwrap();
         fs::write(
-            root.join(".wiki_craft/source_summaries/current/s1.md"),
+            root.join(".wiki_craft/knowledge/approved/evidence/source_summaries/s1.md"),
             "# Source\n\nretrieval retrieval retrieval evidence",
         )
         .unwrap();

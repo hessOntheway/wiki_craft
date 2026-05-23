@@ -1,17 +1,7 @@
 # Wiki Craft configuration.
-# Enable at least one source before running `cargo run -- ingest --once`.
+# Ingest sources live in wiki_craft.ingest.toml.
 # LLM environment variables follow scribe_engine:
 # LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
-
-[[sources]]
-name = "example"
-url = "https://gitcode.csdn.net/6a05afc310ee7a33f272901f.html"
-enabled = true
-timeout_seconds = 15
-max_bytes = 200000
-
-[schedule]
-interval_minutes = 60
 
 [llm]
 base_url = "https://api.deepseek.com"
@@ -20,7 +10,7 @@ max_tokens = 4096
 
 [audit]
 enabled = true
-path = ".wiki_craft/audit/events.jsonl"
+path = ".wiki_craft/runtime/audit/events.jsonl"
 
 [runtime]
 root = ".wiki_craft"
@@ -30,13 +20,13 @@ max_steps = 8
 enabled = true
 auto_token_threshold = 50000
 auto_preserve_recent_messages = 4
-transcript_dir = ".wiki_craft/transcripts"
+transcript_dir = ".wiki_craft/runtime/transcripts"
 
 [prompt_cache]
 enabled = true
-dir = ".wiki_craft/prompt_cache"
+dir = ".wiki_craft/runtime/prompt_cache"
 
 [metrics]
 enabled = true
-dir = ".wiki_craft/metrics"
+dir = ".wiki_craft/runtime/metrics"
 http_bind = "127.0.0.1:9898"

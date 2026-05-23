@@ -1,0 +1,20 @@
+# Wiki Craft ingest sources.
+# `cargo run -- ingest --once` reads ingest.once.sources.
+# `cargo run -- serve` reads ingest.cron.sources.
+
+[ingest.once]
+
+[[ingest.once.sources]]
+url = "https://gitcode.csdn.net/6a05afc310ee7a33f272901f.html"
+enabled = true
+timeout_seconds = 15
+max_bytes = 200000
+
+[ingest.cron]
+
+[[ingest.cron.sources]]
+url = "https://gitcode.csdn.net/6a05afc310ee7a33f272901f.html"
+enabled = false
+interval_hours = 24
+timeout_seconds = 15
+max_bytes = 200000

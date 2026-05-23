@@ -23,7 +23,9 @@ use crate::knowledge::{WorkspacePaths, read_current_knowledge};
 use crate::llm::openai::{OpenAiCompatClient, extract_message_text};
 use crate::llm::session::ConversationSession;
 use crate::llm::usage::PromptCacheStats;
-use crate::sources::{ChangedSource, FetchedSource, SourceManifest, fetched_from_output};
+use crate::sources::{
+    ChangedSource, FetchedSource, SourceManifest, fetched_from_output, source_id_for_url,
+};
 use crate::support::audit::{append_event, compaction_event, tool_call_event, tool_result_event};
 use crate::support::compact::{auto_compact_if_needed, remove_orphan_tool_messages};
 use crate::support::metrics::{
@@ -408,6 +410,7 @@ The candidate knowledge base is an Obsidian-style vault:
 #[serde(rename_all = "snake_case")]
 pub enum IngestOutcomeKind {
     NoSources,
+    NoDueSources,
     Unchanged,
     CandidateCreated,
 }
@@ -453,15 +456,74 @@ pub(crate) fn run_ingest_with_dependencies(
     generator: &mut dyn KnowledgeGenerator,
     fetcher: &mut dyn SourceFetcher,
 ) -> Result<IngestOutcome> {
+    run_ingest_for_sources(
+        paths,
+        generator,
+        fetcher,
+        config.enabled_once_sources(),
+        "no enabled once sources configured",
+    )
+}
+
+pub(crate) fn run_cron_ingest_with_dependencies(
+    config: &AppConfig,
+    paths: &WorkspacePaths,
+    generator: &mut dyn KnowledgeGenerator,
+    fetcher: &mut dyn SourceFetcher,
+) -> Result<IngestOutcome> {
     paths.ensure_all()?;
-    let enabled_sources = config.enabled_sources();
+    let enabled_sources = config.enabled_cron_sources();
     if enabled_sources.is_empty() {
         let outcome = IngestOutcome {
             kind: IngestOutcomeKind::NoSources,
             run_id: None,
             changed_sources: Vec::new(),
             checked_sources: 0,
-            message: "no enabled sources configured".to_string(),
+            message: "no enabled cron sources configured".to_string(),
+        };
+        write_status(paths, Some(outcome.clone()), generator.telemetry())?;
+        return Ok(outcome);
+    }
+
+    let manifest = SourceManifest::load(&paths.manifest_path)?;
+    let now = now_unix_ms();
+    let due_sources = due_cron_sources(enabled_sources, &manifest, now);
+    if due_sources.is_empty() {
+        let outcome = IngestOutcome {
+            kind: IngestOutcomeKind::NoDueSources,
+            run_id: None,
+            changed_sources: Vec::new(),
+            checked_sources: 0,
+            message: "no cron sources are due".to_string(),
+        };
+        write_status(paths, Some(outcome.clone()), generator.telemetry())?;
+        return Ok(outcome);
+    }
+
+    run_ingest_for_sources(
+        paths,
+        generator,
+        fetcher,
+        due_sources,
+        "no enabled cron sources configured",
+    )
+}
+
+pub(crate) fn run_ingest_for_sources(
+    paths: &WorkspacePaths,
+    generator: &mut dyn KnowledgeGenerator,
+    fetcher: &mut dyn SourceFetcher,
+    enabled_sources: Vec<&SourceConfig>,
+    no_sources_message: &str,
+) -> Result<IngestOutcome> {
+    paths.ensure_all()?;
+    if enabled_sources.is_empty() {
+        let outcome = IngestOutcome {
+            kind: IngestOutcomeKind::NoSources,
+            run_id: None,
+            changed_sources: Vec::new(),
+            checked_sources: 0,
+            message: no_sources_message.to_string(),
         };
         write_status(paths, Some(outcome.clone()), generator.telemetry())?;
         return Ok(outcome);
@@ -514,7 +576,7 @@ pub(crate) fn run_ingest_with_dependencies(
             title: fetched.title.clone(),
             previous_hash: manifest.previous_hash(&fetched.source_id),
             new_hash: fetched.content_hash.clone(),
-            summary_path: format!("source_summaries/{summary_rel}"),
+            summary_path: format!("evidence/source_summaries/{summary_rel}"),
         };
         changed_summaries.push((changed, summary));
     }
@@ -542,11 +604,13 @@ pub(crate) fn run_ingest_with_dependencies(
         manifest.upsert_fetched(
             fetched,
             Some(&run_id),
-            Some(format!(
-                "{}/{}",
-                candidate_paths.source_summaries.display(),
-                changed.summary_path.trim_start_matches("source_summaries/")
-            )),
+            Some(
+                candidate_paths
+                    .source_summaries
+                    .join(format!("{}.md", changed.source_id))
+                    .display()
+                    .to_string(),
+            ),
         );
     }
     manifest.last_run_id = Some(run_id.clone());
@@ -588,11 +652,76 @@ pub fn reorganize(config_path: &Path) -> Result<ReorganizeOutcome> {
     })
 }
 
+fn due_cron_sources<'a>(
+    sources: Vec<&'a SourceConfig>,
+    manifest: &SourceManifest,
+    now_unix_ms: u128,
+) -> Vec<&'a SourceConfig> {
+    sources
+        .into_iter()
+        .filter(|source| cron_source_due(source, manifest, now_unix_ms))
+        .collect()
+}
+
+fn cron_source_due(source: &SourceConfig, manifest: &SourceManifest, now_unix_ms: u128) -> bool {
+    let source_id = source_id_for_url(&source.url);
+    let Some(record) = manifest.sources.get(&source_id) else {
+        return true;
+    };
+    now_unix_ms.saturating_sub(record.last_fetched_unix_ms)
+        >= hours_to_ms(source.cron_interval_hours())
+}
+
+fn next_cron_sleep_minutes(
+    config: &AppConfig,
+    manifest: &SourceManifest,
+    now_unix_ms: u128,
+) -> u64 {
+    let enabled_sources = config.enabled_cron_sources();
+    if enabled_sources.is_empty() {
+        return 1;
+    }
+
+    let min_wait_ms = enabled_sources
+        .into_iter()
+        .map(|source| {
+            let source_id = source_id_for_url(&source.url);
+            let Some(record) = manifest.sources.get(&source_id) else {
+                return 0;
+            };
+            let due_at = record
+                .last_fetched_unix_ms
+                .saturating_add(hours_to_ms(source.cron_interval_hours()));
+            due_at.saturating_sub(now_unix_ms)
+        })
+        .min()
+        .unwrap_or(0);
+
+    ms_to_sleep_minutes(min_wait_ms).max(1)
+}
+
+fn hours_to_ms(hours: u64) -> u128 {
+    u128::from(hours.max(1)) * 60 * 60 * 1000
+}
+
+fn ms_to_sleep_minutes(ms: u128) -> u64 {
+    let minutes = ms.div_ceil(60_000);
+    u64::try_from(minutes).unwrap_or(u64::MAX)
+}
+
 pub fn run_production_ingest(config_path: &Path) -> Result<IngestOutcome> {
     let config = AppConfig::load(config_path)?;
     let paths = WorkspacePaths::from_config(&config);
     let mut generator = LazyLlmKnowledgeGenerator::new(config.clone(), paths.clone());
     run_ingest_with_generator(&config, &paths, &mut generator)
+}
+
+pub fn run_production_cron_ingest(config_path: &Path) -> Result<IngestOutcome> {
+    let config = AppConfig::load(config_path)?;
+    let paths = WorkspacePaths::from_config(&config);
+    let mut generator = LazyLlmKnowledgeGenerator::new(config.clone(), paths.clone());
+    let mut fetcher = WebSourceFetcher;
+    run_cron_ingest_with_dependencies(&config, &paths, &mut generator, &mut fetcher)
 }
 
 pub fn serve(config_path: &Path) -> Result<()> {
@@ -607,12 +736,14 @@ pub fn serve(config_path: &Path) -> Result<()> {
     }
 
     loop {
-        match run_production_ingest(config_path) {
+        match run_production_cron_ingest(config_path) {
             Ok(outcome) => eprintln!("info: ingest completed: {}", outcome.message),
             Err(error) => eprintln!("error: ingest failed: {error:?}"),
         }
         let config = AppConfig::load(config_path)?;
-        let minutes = config.schedule.interval_minutes.max(1);
+        let paths = WorkspacePaths::from_config(&config);
+        let manifest = SourceManifest::load(&paths.manifest_path).unwrap_or_default();
+        let minutes = next_cron_sleep_minutes(&config, &manifest, now_unix_ms());
         eprintln!("info: sleeping {minutes} minute(s) before next ingest");
         thread::sleep(Duration::from_secs(minutes * 60));
     }
@@ -745,6 +876,7 @@ fn metrics_from_status(status: &StatusSnapshot) -> MetricsSnapshot {
             (
                 Some(match run.kind {
                     IngestOutcomeKind::NoSources => "no_sources".to_string(),
+                    IngestOutcomeKind::NoDueSources => "no_due_sources".to_string(),
                     IngestOutcomeKind::Unchanged => "unchanged".to_string(),
                     IngestOutcomeKind::CandidateCreated => "candidate_created".to_string(),
                 }),
@@ -832,7 +964,9 @@ fn write_http_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, SourceConfig};
+    use crate::config::{
+        AppConfig, CronIngestConfig, IngestConfig, OnceIngestConfig, SourceConfig,
+    };
     use crate::knowledge::WorkspacePaths;
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -896,13 +1030,18 @@ mod tests {
     fn ingest_skips_unchanged_second_run() {
         let root = unique_temp_dir("wiki-craft-ingest-test");
         let cfg = AppConfig {
-            sources: vec![SourceConfig {
-                url: "https://example.test/doc".to_string(),
-                name: Some("local".to_string()),
-                enabled: true,
-                timeout_seconds: 5,
-                max_bytes: 1000,
-            }],
+            ingest: IngestConfig {
+                once: OnceIngestConfig {
+                    sources: vec![SourceConfig {
+                        url: "https://example.test/doc".to_string(),
+                        enabled: true,
+                        timeout_seconds: 5,
+                        max_bytes: 1000,
+                        interval_hours: None,
+                    }],
+                },
+                ..Default::default()
+            },
             runtime: crate::config::RuntimeConfig {
                 root: root.to_string_lossy().to_string(),
                 max_steps: 4,
@@ -931,13 +1070,18 @@ mod tests {
     fn ingest_candidate_keeps_existing_source_summaries() {
         let root = unique_temp_dir("wiki-craft-source-summary-copy-test");
         let cfg = AppConfig {
-            sources: vec![SourceConfig {
-                url: "https://example.test/doc".to_string(),
-                name: Some("local".to_string()),
-                enabled: true,
-                timeout_seconds: 5,
-                max_bytes: 1000,
-            }],
+            ingest: IngestConfig {
+                once: OnceIngestConfig {
+                    sources: vec![SourceConfig {
+                        url: "https://example.test/doc".to_string(),
+                        enabled: true,
+                        timeout_seconds: 5,
+                        max_bytes: 1000,
+                        interval_hours: None,
+                    }],
+                },
+                ..Default::default()
+            },
             runtime: crate::config::RuntimeConfig {
                 root: root.to_string_lossy().to_string(),
                 max_steps: 4,
@@ -962,6 +1106,47 @@ mod tests {
         let candidate = CandidatePaths::new(&paths, &run_id);
 
         assert!(candidate.source_summaries.join("existing.md").exists());
+    }
+
+    #[test]
+    fn cron_ingest_skips_sources_that_are_not_due() {
+        let root = unique_temp_dir("wiki-craft-cron-due-test");
+        let cfg = AppConfig {
+            ingest: IngestConfig {
+                cron: CronIngestConfig {
+                    sources: vec![SourceConfig {
+                        url: "https://example.test/cron".to_string(),
+                        enabled: true,
+                        timeout_seconds: 5,
+                        max_bytes: 1000,
+                        interval_hours: Some(24),
+                    }],
+                },
+                ..Default::default()
+            },
+            runtime: crate::config::RuntimeConfig {
+                root: root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        };
+        let paths = WorkspacePaths::from_config(&cfg);
+        let mut generator = FakeGenerator::new();
+        let mut first_fetcher = FakeFetcher {
+            outputs: VecDeque::from([fake_fetch_output("https://example.test/cron", "hello")]),
+        };
+        let first =
+            run_cron_ingest_with_dependencies(&cfg, &paths, &mut generator, &mut first_fetcher)
+                .expect("first cron ingest");
+        assert!(matches!(first.kind, IngestOutcomeKind::CandidateCreated));
+
+        let mut second_fetcher = FakeFetcher {
+            outputs: VecDeque::new(),
+        };
+        let second =
+            run_cron_ingest_with_dependencies(&cfg, &paths, &mut generator, &mut second_fetcher)
+                .expect("second cron ingest");
+        assert!(matches!(second.kind, IngestOutcomeKind::NoDueSources));
     }
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {

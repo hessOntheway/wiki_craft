@@ -42,7 +42,6 @@ pub struct SourceRecord {
 #[derive(Debug, Clone)]
 pub struct FetchedSource {
     pub source_id: String,
-    pub config_name: Option<String>,
     pub url: String,
     pub final_url: String,
     pub title: Option<String>,
@@ -156,7 +155,6 @@ pub fn fetched_from_output(config: &SourceConfig, output: WebFetchOutput) -> Fet
     let source_id = source_id_for_url(&config.url);
     FetchedSource {
         source_id,
-        config_name: config.name.clone(),
         url: config.url.clone(),
         final_url: output.final_url,
         title: output.title,
@@ -213,7 +211,6 @@ mod tests {
         };
         let fetched = FetchedSource {
             source_id: "s1".to_string(),
-            config_name: None,
             url: "https://example.com".to_string(),
             final_url: "https://example.com".to_string(),
             title: None,

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use wiki_craft::config::DEFAULT_CONFIG_PATH;
 use wiki_craft::knowledge::initialize_project;
@@ -77,7 +77,10 @@ fn main() -> Result<()> {
             let report = initialize_project(&cli.config)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::Ingest { once: _ } => {
+        Command::Ingest { once } => {
+            if !once {
+                bail!("use `ingest --once` for one-time sources or `serve` for periodic sources");
+            }
             let outcome = runtime::run_production_ingest(&cli.config)?;
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }

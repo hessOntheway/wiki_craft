@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, default_config_toml};
+use crate::config::{
+    AppConfig, default_config_toml, default_ingest_config_toml, ingest_config_path_for,
+};
 use crate::support::markdown_heading;
 
 pub const DEFAULT_SCHEMA_PATH: &str = "WIKI_CRAFT.md";
@@ -270,7 +272,9 @@ pub struct WorkspacePaths {
 impl WorkspacePaths {
     pub fn from_config(config: &AppConfig) -> Self {
         let root = PathBuf::from(&config.runtime.root);
-        let sources_dir = root.join("sources");
+        let approved_knowledge = root.join("knowledge").join("approved");
+        let approved_evidence = approved_knowledge.join("evidence");
+        let sources_dir = approved_evidence.join("sources");
         let metrics_dir = PathBuf::from(&config.metrics.dir);
         let audit_events_path = PathBuf::from(&config.audit.path);
         let audit_dir = audit_events_path
@@ -279,18 +283,18 @@ impl WorkspacePaths {
             .unwrap_or_else(|| root.join("audit"));
         Self {
             manifest_path: sources_dir.join("manifest.json"),
-            source_summaries_current: root.join("source_summaries").join("current"),
-            knowledge_current: root.join("knowledge").join("current"),
-            candidates_dir: root.join("candidates"),
-            sessions_dir: root.join("sessions"),
-            transcripts_dir: root.join("transcripts"),
-            prompt_cache_dir: root.join("prompt_cache"),
+            source_summaries_current: approved_evidence.join("source_summaries"),
+            knowledge_current: approved_knowledge,
+            candidates_dir: root.join("knowledge").join("staging").join("candidates"),
+            sessions_dir: root.join("runtime").join("sessions"),
+            transcripts_dir: PathBuf::from(&config.context_compact.transcript_dir),
+            prompt_cache_dir: PathBuf::from(&config.prompt_cache.dir),
             audit_dir,
             audit_events_path,
             metrics_latest_path: metrics_dir.join("latest.json"),
             metrics_events_path: metrics_dir.join("events.jsonl"),
             metrics_dir,
-            status_path: root.join("status.json"),
+            status_path: root.join("runtime").join("status.json"),
             root,
             sources_dir,
         }
@@ -319,6 +323,7 @@ impl WorkspacePaths {
 #[derive(Debug, Clone, Serialize)]
 pub struct InitReport {
     pub config_path: String,
+    pub ingest_config_path: String,
     pub schema_path: String,
     pub runtime_root: String,
     pub created: Vec<String>,
@@ -337,6 +342,13 @@ pub fn initialize_project(config_path: &Path) -> Result<InitReport> {
         &mut created,
         &mut existing,
     )?;
+    let ingest_config_path = ingest_config_path_for(config_path);
+    write_if_missing(
+        &ingest_config_path,
+        default_ingest_config_toml(),
+        &mut created,
+        &mut existing,
+    )?;
     write_if_missing(
         Path::new(DEFAULT_SCHEMA_PATH),
         default_schema_markdown(),
@@ -349,6 +361,7 @@ pub fn initialize_project(config_path: &Path) -> Result<InitReport> {
 
     Ok(InitReport {
         config_path: config_path.display().to_string(),
+        ingest_config_path: ingest_config_path.display().to_string(),
         schema_path: DEFAULT_SCHEMA_PATH.to_string(),
         runtime_root: paths.root.display().to_string(),
         created,
@@ -386,10 +399,11 @@ This file is the human-readable operating contract for the Wiki Craft knowledge 
 
 AI coding tools should read approved knowledge from:
 
-- `.wiki_craft/knowledge/current/`
-- `.wiki_craft/source_summaries/current/`
+- `.wiki_craft/knowledge/approved/index.md`
+- `.wiki_craft/knowledge/approved/topics/*.md`
+- `.wiki_craft/knowledge/approved/evidence/source_summaries/`
 
-Candidate updates live under `.wiki_craft/candidates/{run_id}/` and are not authoritative until approved.
+Candidate updates live under `.wiki_craft/knowledge/staging/candidates/{run_id}/` and are not authoritative until approved.
 
 ## Maintenance Rules
 
@@ -401,11 +415,11 @@ Candidate updates live under `.wiki_craft/candidates/{run_id}/` and are not auth
 
 ## Vault Layout
 
-- `.wiki_craft/knowledge/current/index.md` is the approved wiki entry point.
-- `.wiki_craft/knowledge/current/topics/*.md` contains topic-first Obsidian-style pages.
+- `.wiki_craft/knowledge/approved/index.md` is the approved wiki entry point.
+- `.wiki_craft/knowledge/approved/topics/*.md` contains topic-first Obsidian-style pages.
 - Topic pages should use YAML frontmatter with `title`, `aliases`, `tags`, `source_ids`, `source_urls`, `version_hashes`, and `updated_at_run_id`.
 - Source summaries should include key claims, methods or workflows, useful keywords, and diagrams only when they clarify the material.
-- Claude Code, Codex, and similar tools should begin by reading this file and `.wiki_craft/knowledge/current/index.md`, then follow wikilinks into topic pages.
+- Claude Code, Codex, and similar tools should begin by reading this file and `.wiki_craft/knowledge/approved/index.md`, then follow wikilinks into topic pages.
 "#
 }
 

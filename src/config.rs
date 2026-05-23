@@ -5,16 +5,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONFIG_PATH: &str = "wiki_craft.toml";
+pub const DEFAULT_INGEST_CONFIG_PATH: &str = "wiki_craft.ingest.toml";
 pub const DEFAULT_RUNTIME_ROOT: &str = ".wiki_craft";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
-    #[serde(default)]
-    pub sources: Vec<SourceConfig>,
-    #[serde(default)]
-    pub schedule: ScheduleConfig,
+    #[serde(default, skip)]
+    pub ingest: IngestConfig,
     #[serde(default)]
     pub llm: LlmSettings,
     #[serde(default)]
@@ -34,8 +33,10 @@ impl AppConfig {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("failed to parse config: {}", path.display()))
+        let mut config: Self = toml::from_str(&content)
+            .with_context(|| format!("failed to parse config: {}", path.display()))?;
+        config.ingest = IngestConfig::load_or_default(ingest_config_path_for(path))?;
+        Ok(config)
     }
 
     pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self> {
@@ -43,12 +44,29 @@ impl AppConfig {
         if path.exists() {
             Self::load(path)
         } else {
-            Ok(Self::default())
+            let mut config = Self::default();
+            config.ingest = IngestConfig::load_or_default(ingest_config_path_for(path))?;
+            Ok(config)
         }
     }
 
     pub fn enabled_sources(&self) -> Vec<&SourceConfig> {
-        self.sources
+        self.enabled_once_sources()
+    }
+
+    pub fn enabled_once_sources(&self) -> Vec<&SourceConfig> {
+        self.ingest
+            .once
+            .sources
+            .iter()
+            .filter(|source| source.enabled)
+            .collect()
+    }
+
+    pub fn enabled_cron_sources(&self) -> Vec<&SourceConfig> {
+        self.ingest
+            .cron
+            .sources
             .iter()
             .filter(|source| source.enabled)
             .collect()
@@ -102,30 +120,70 @@ impl AppConfig {
     }
 }
 
+impl IngestConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read ingest config: {}", path.display()))?;
+        let file: IngestFileConfig = toml::from_str(&content)
+            .with_context(|| format!("failed to parse ingest config: {}", path.display()))?;
+        Ok(file.ingest)
+    }
+
+    pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if path.exists() {
+            Self::load(path)
+        } else {
+            Ok(Self::default())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct IngestFileConfig {
+    #[serde(default)]
+    ingest: IngestConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IngestConfig {
+    #[serde(default)]
+    pub once: OnceIngestConfig,
+    #[serde(default)]
+    pub cron: CronIngestConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OnceIngestConfig {
+    #[serde(default)]
+    pub sources: Vec<SourceConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CronIngestConfig {
+    #[serde(default)]
+    pub sources: Vec<SourceConfig>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub url: String,
-    #[serde(default)]
-    pub name: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_fetch_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_fetch_bytes")]
     pub max_bytes: usize,
+    #[serde(default)]
+    pub interval_hours: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduleConfig {
-    #[serde(default = "default_interval_minutes")]
-    pub interval_minutes: u64,
-}
-
-impl Default for ScheduleConfig {
-    fn default() -> Self {
-        Self {
-            interval_minutes: default_interval_minutes(),
-        }
+impl SourceConfig {
+    pub fn cron_interval_hours(&self) -> u64 {
+        self.interval_hours
+            .unwrap_or_else(default_cron_interval_hours)
+            .max(1)
     }
 }
 
@@ -267,18 +325,8 @@ pub struct ResolvedLlmConfig {
 
 pub fn default_config_toml() -> &'static str {
     r#"# Wiki Craft configuration.
-# Add one or more enabled sources. v1 fetches only these entry URLs.
+# Ingest sources live in wiki_craft.ingest.toml.
 # LLM env vars follow scribe_engine: LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
-
-[[sources]]
-name = "example"
-url = "https://example.com"
-enabled = false
-timeout_seconds = 15
-max_bytes = 200000
-
-[schedule]
-interval_minutes = 60
 
 [llm]
 base_url = "https://api.deepseek.com"
@@ -287,7 +335,7 @@ max_tokens = 4096
 
 [audit]
 enabled = true
-path = ".wiki_craft/audit/events.jsonl"
+path = ".wiki_craft/runtime/audit/events.jsonl"
 
 [runtime]
 root = ".wiki_craft"
@@ -297,17 +345,49 @@ max_steps = 8
 enabled = true
 auto_token_threshold = 50000
 auto_preserve_recent_messages = 4
-transcript_dir = ".wiki_craft/transcripts"
+transcript_dir = ".wiki_craft/runtime/transcripts"
 
 [prompt_cache]
 enabled = true
-dir = ".wiki_craft/prompt_cache"
+dir = ".wiki_craft/runtime/prompt_cache"
 
 [metrics]
 enabled = true
-dir = ".wiki_craft/metrics"
+dir = ".wiki_craft/runtime/metrics"
 http_bind = "127.0.0.1:9898"
 "#
+}
+
+pub fn default_ingest_config_toml() -> &'static str {
+    r#"# Wiki Craft ingest sources.
+# `cargo run -- ingest --once` reads ingest.once.sources.
+# `cargo run -- serve` reads ingest.cron.sources.
+
+[ingest.once]
+
+[[ingest.once.sources]]
+url = "https://example.com/once"
+enabled = false
+timeout_seconds = 15
+max_bytes = 200000
+
+[ingest.cron]
+
+[[ingest.cron.sources]]
+url = "https://example.com/cron"
+enabled = false
+interval_hours = 24
+timeout_seconds = 15
+max_bytes = 200000
+"#
+}
+
+pub fn ingest_config_path_for(config_path: &Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(DEFAULT_INGEST_CONFIG_PATH))
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_INGEST_CONFIG_PATH))
 }
 
 fn non_empty(value: &str) -> bool {
@@ -318,8 +398,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_interval_minutes() -> u64 {
-    60
+fn default_cron_interval_hours() -> u64 {
+    24
 }
 
 fn default_fetch_timeout_seconds() -> u64 {
@@ -351,7 +431,7 @@ fn default_auto_compact_preserve_recent_messages() -> usize {
 }
 
 fn default_transcript_dir() -> String {
-    ".wiki_craft/transcripts".to_string()
+    ".wiki_craft/runtime/transcripts".to_string()
 }
 
 fn default_prompt_cache_enabled() -> bool {
@@ -359,7 +439,7 @@ fn default_prompt_cache_enabled() -> bool {
 }
 
 fn default_prompt_cache_dir() -> String {
-    ".wiki_craft/prompt_cache".to_string()
+    ".wiki_craft/runtime/prompt_cache".to_string()
 }
 
 fn default_metrics_enabled() -> bool {
@@ -367,7 +447,7 @@ fn default_metrics_enabled() -> bool {
 }
 
 fn default_metrics_dir() -> String {
-    ".wiki_craft/metrics".to_string()
+    ".wiki_craft/runtime/metrics".to_string()
 }
 
 fn default_metrics_http_bind() -> String {
@@ -379,7 +459,7 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_audit_log_path() -> String {
-    ".wiki_craft/audit/events.jsonl".to_string()
+    ".wiki_craft/runtime/audit/events.jsonl".to_string()
 }
 
 fn default_audit_enabled() -> bool {
@@ -411,5 +491,77 @@ mod tests {
         let resolved = cfg.resolve_llm_with(|key| env.get(key).cloned());
 
         assert_eq!(resolved.api_key.as_deref(), Some("llm-key"));
+    }
+
+    #[test]
+    fn parses_ingest_source_groups() {
+        let file: IngestFileConfig = toml::from_str(
+            r#"
+[ingest.once]
+
+[[ingest.once.sources]]
+url = "https://example.test/once"
+enabled = true
+timeout_seconds = 5
+max_bytes = 1000
+
+[ingest.cron]
+
+[[ingest.cron.sources]]
+url = "https://example.test/cron"
+enabled = true
+interval_hours = 6
+timeout_seconds = 5
+max_bytes = 1000
+
+[[ingest.cron.sources]]
+url = "https://example.test/disabled"
+enabled = false
+"#,
+        )
+        .expect("ingest config");
+
+        let cfg = AppConfig {
+            ingest: file.ingest,
+            ..Default::default()
+        };
+        assert_eq!(cfg.enabled_once_sources().len(), 1);
+        assert_eq!(cfg.enabled_cron_sources().len(), 1);
+        assert_eq!(cfg.ingest.cron.sources[0].cron_interval_hours(), 6);
+    }
+
+    #[test]
+    fn app_config_loads_sibling_ingest_config() {
+        let root = std::env::temp_dir().join(format!(
+            "wiki-craft-config-test-{}",
+            crate::support::now_unix_ms()
+        ));
+        fs::create_dir_all(&root).expect("temp dir");
+        let config_path = root.join(DEFAULT_CONFIG_PATH);
+        fs::write(&config_path, "[runtime]\nroot = \".wiki_craft\"\n").expect("main config");
+        fs::write(
+            root.join(DEFAULT_INGEST_CONFIG_PATH),
+            "[ingest.once]\n\n[[ingest.once.sources]]\nurl = \"https://example.test/once\"\n",
+        )
+        .expect("ingest config");
+
+        let cfg = AppConfig::load(&config_path).expect("config");
+
+        assert_eq!(cfg.ingest.once.sources.len(), 1);
+        assert_eq!(cfg.ingest.once.sources[0].url, "https://example.test/once");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cron_interval_defaults_to_one_day() {
+        let source = SourceConfig {
+            url: "https://example.test/cron".to_string(),
+            enabled: true,
+            timeout_seconds: 5,
+            max_bytes: 1000,
+            interval_hours: None,
+        };
+
+        assert_eq!(source.cron_interval_hours(), 24);
     }
 }
