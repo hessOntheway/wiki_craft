@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 regex = "1"
@@ -12,5 +13,10 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
 walkdir = "2"
+
+[dev-dependencies]
+tower = "0.5"

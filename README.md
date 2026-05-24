@@ -11,54 +11,6 @@ The project has two core systems:
 
 Wiki Craft intentionally keeps the storage model simple: no vector database, no embedding pipeline, no raw-source archive. The approved Markdown vault is the retrieval surface. Source summaries are the evidence layer. Candidate updates are staged, diffed, and approved before becoming authoritative.
 
-## Runtime Layout
-
-```text
-.wiki_craft/
-  knowledge/
-    approved/
-      index.md
-      topics/
-        *.md
-      evidence/
-        source_summaries/
-          *.md
-        sources/
-          manifest.json
-    staging/
-      candidates/
-        {run_id}/
-          baseline/
-            knowledge/
-              index.md
-              topics/
-                *.md
-          knowledge/
-            index.md
-            topics/
-              *.md
-          evidence/
-            source_summaries/
-              *.md
-          diff.md
-          metadata.json
-  runtime/
-    audit/
-    metrics/
-    prompt_cache/
-    sessions/
-    transcripts/
-```
-
-Important directories:
-
-- `.wiki_craft/knowledge/approved/index.md`: approved vault entry point.
-- `.wiki_craft/knowledge/approved/topics/*.md`: approved topic-first knowledge pages.
-- `.wiki_craft/knowledge/approved/evidence/sources/manifest.json`: source registry with URLs, content hashes, fetch timestamps, latest candidate run IDs, and summary paths.
-- `.wiki_craft/knowledge/approved/evidence/source_summaries/*.md`: approved LLM-written summaries for source versions.
-- `.wiki_craft/knowledge/staging/candidates/{run_id}/`: staged source summaries, optional proposed knowledge, baseline snapshots, diffs, and metadata waiting for review.
-- `.wiki_craft/runtime/`: operational state such as sessions, prompt cache, audit events, metrics, transcripts, and status.
-
 ## Quick Start
 
 ```bash
@@ -106,6 +58,35 @@ cargo run -- serve
 
 - `http://127.0.0.1:9898/metrics`
 - `http://127.0.0.1:9898/metrics.json`
+
+## Desktop GUI
+
+Wiki Craft also includes a local Tauri desktop GUI for reviewing staged candidates. It uses the same approval model as the CLI:
+
+- `summaries_staged`: review changed source summaries, then approve summaries to generate a candidate knowledge diff.
+- `diff_ready`: review the colorized `diff.md`, then merge the accepted diff into approved knowledge.
+- Reject remains explicit and removes the staged candidate without changing approved knowledge.
+
+Install and build the frontend once:
+
+```bash
+npm --prefix frontend install
+npm run build
+```
+
+Run the desktop app in development:
+
+```bash
+npm run tauri -- dev
+```
+
+Run these commands from the repository root. The desktop shell starts a local API server on an ephemeral `127.0.0.1` port and injects that URL into the React UI. By default it reads `wiki_craft.toml`; set `WIKI_CRAFT_CONFIG=/path/to/wiki_craft.toml` before launch to review a different workspace.
+
+GUI and service logs are separate from the LLM audit log:
+
+- `.wiki_craft/runtime/gui/events.jsonl`: desktop UI events, action failures, and local API request failures reported by the frontend/Tauri shell.
+- `.wiki_craft/runtime/web/events.jsonl`: local Axum API startup and candidate action job lifecycle events.
+- `.wiki_craft/runtime/audit/events.jsonl`: model/tool-call audit trail for LLM workflows only.
 
 ## Search
 
@@ -183,36 +164,6 @@ After raw scoring:
 - Longer chunks receive a length penalty, so concise focused sections can compete with large evidence blocks.
 
 Result ordering is deterministic: score first, then result kind priority, path, and line number.
-
-### Result Shape
-
-```json
-{
-  "query": "retrieval",
-  "top_k": 5,
-  "results": [
-    {
-      "path": ".wiki_craft/knowledge/approved/topics/search.md",
-      "kind": "topic",
-      "title": "Search",
-      "heading": "Search",
-      "score": 42.5,
-      "line_start": 10,
-      "line_end": 14,
-      "snippet": "# Search\n...",
-      "aliases": ["lookup"],
-      "tags": ["knowledge"],
-      "wikilinks": ["topics/index"],
-      "source_ids": ["abc123"],
-      "source_urls": ["https://example.test/article"],
-      "version_hashes": ["abcdef1234567890"],
-      "updated_at_run_id": "run_123"
-    }
-  ]
-}
-```
-
-Every result can point back to a Markdown path, line range, snippet, and evidence metadata. That explainability is the main reason search is built on the approved Markdown structure.
 
 ## Ingest And Indexing
 
@@ -409,6 +360,8 @@ Because merge replaces the approved topic/index vault, every proposed knowledge 
 
 After merge, manifest summary paths are updated to point at the approved source-summary location, and the approved candidate directory is removed from staging.
 
+The desktop GUI exposes the same steps as buttons: `Approve Summaries` for `summaries_staged`, `Merge Diff` for `diff_ready`, and `Reject` for unapproved candidates. The GUI renders `diff.md` with editor-style colors but does not change the approval semantics.
+
 ## Reorganizing Existing Knowledge
 
 Use this command to convert existing approved Markdown into a candidate topic-first vault:
@@ -429,6 +382,7 @@ Review and merge it like any ingest candidate.
 - Candidate updates are staged and diffed before approval.
 - Search never treats candidate content as approved knowledge.
 - Source summaries preserve traceability, but topic pages are the primary retrieval layer.
+- Runtime GUI and service diagnostics are written under `.wiki_craft/runtime/gui/` and `.wiki_craft/runtime/web/`; the audit log remains reserved for the LLM call chain.
 
 ## Implementation Map
 
@@ -439,6 +393,9 @@ Review and merge it like any ingest candidate.
 - `src/knowledge.rs`: vault file validation, frontmatter parsing, wikilink extraction, current knowledge reading, and reorganizer.
 - `src/search.rs`: approved-knowledge retrieval, chunking, scoring, snippets, and JSON/text output.
 - `src/candidates.rs`: candidate paths, metadata, diffs, listing, and directory promotion.
+- `src/web.rs`: local Axum JSON API for the desktop GUI.
+- `frontend/`: React/Vite candidate review UI.
+- `src-tauri/`: Tauri desktop shell that starts the local API and hosts the built frontend.
 
 ## Development
 
@@ -447,4 +404,6 @@ Run checks:
 ```bash
 cargo fmt
 cargo test
+cargo check --manifest-path src-tauri/Cargo.toml
+npm run build
 ```

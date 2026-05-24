@@ -1,5 +1,9 @@
 /target
+src-tauri/target/
+src-tauri/gen/
 .wiki_craft/
 .agents/
 wiki_craft.ingest.toml
 wiki_craft.toml
+frontend/dist/
+frontend/node_modules/

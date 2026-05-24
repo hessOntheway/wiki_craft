@@ -7,3 +7,4 @@ pub mod search;
 pub mod sources;
 pub(crate) mod support;
 pub mod tools;
+pub mod web;
