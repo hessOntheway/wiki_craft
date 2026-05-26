@@ -1,12 +1,15 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONFIG_PATH: &str = "wiki_craft.toml";
-pub const DEFAULT_INGEST_CONFIG_PATH: &str = "wiki_craft.ingest.toml";
 pub const DEFAULT_RUNTIME_ROOT: &str = ".wiki_craft";
+pub const KNOWLEDGE_BASES_DIR: &str = "knowledge_bases";
+pub const KNOWLEDGE_BASE_REGISTRY_FILE: &str = "registry.json";
+pub const KNOWLEDGE_BASE_CONFIG_FILE: &str = "knowledge_base.toml";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 
@@ -14,6 +17,8 @@ pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 pub struct AppConfig {
     #[serde(default, skip)]
     pub ingest: IngestConfig,
+    #[serde(default, skip)]
+    pub knowledge_base: Option<ActiveKnowledgeBase>,
     #[serde(default)]
     pub llm: LlmSettings,
     #[serde(default)]
@@ -31,11 +36,18 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let mut config = Self::load_global(path)?;
+        config.load_active_knowledge_base()?;
+        Ok(config)
+    }
+
+    pub fn load_global(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
         let mut config: Self = toml::from_str(&content)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
-        config.ingest = IngestConfig::load_or_default(ingest_config_path_for(path))?;
+        config.resolve_relative_paths(path);
         Ok(config)
     }
 
@@ -45,9 +57,75 @@ impl AppConfig {
             Self::load(path)
         } else {
             let mut config = Self::default();
-            config.ingest = IngestConfig::load_or_default(ingest_config_path_for(path))?;
+            config.load_active_knowledge_base()?;
             Ok(config)
         }
+    }
+
+    fn load_active_knowledge_base(&mut self) -> Result<()> {
+        let registry = KnowledgeBaseRegistry::load(&self.knowledge_base_registry_path())?;
+        let Some(active_id) = registry.active_id.as_deref() else {
+            self.ingest = IngestConfig::default();
+            self.knowledge_base = None;
+            return Ok(());
+        };
+        self.load_knowledge_base_from_registry(&registry, active_id)
+    }
+
+    pub fn select_knowledge_base(&mut self, id: &str) -> Result<()> {
+        let registry = KnowledgeBaseRegistry::load(&self.knowledge_base_registry_path())?;
+        self.load_knowledge_base_from_registry(&registry, id)
+    }
+
+    fn load_knowledge_base_from_registry(
+        &mut self,
+        registry: &KnowledgeBaseRegistry,
+        id: &str,
+    ) -> Result<()> {
+        let record = registry
+            .knowledge_bases
+            .iter()
+            .find(|record| record.id == id)
+            .with_context(|| format!("knowledge base not found in registry: {id}"))?;
+        let file = KnowledgeBaseFileConfig::load(
+            &PathBuf::from(&record.root).join(KNOWLEDGE_BASE_CONFIG_FILE),
+        )?;
+        self.ingest = file.ingest;
+        self.knowledge_base = Some(ActiveKnowledgeBase {
+            id: record.id.clone(),
+            name: file.name,
+            focus: file.focus,
+            root: record.root.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn knowledge_bases_root(&self) -> PathBuf {
+        PathBuf::from(&self.runtime.root).join(KNOWLEDGE_BASES_DIR)
+    }
+
+    pub fn knowledge_base_registry_path(&self) -> PathBuf {
+        self.knowledge_bases_root()
+            .join(KNOWLEDGE_BASE_REGISTRY_FILE)
+    }
+
+    pub fn active_knowledge_base(&self) -> Result<&ActiveKnowledgeBase> {
+        self.knowledge_base.as_ref().context(
+            "no active knowledge base; create one in the GUI or run `knowledge-base create`",
+        )
+    }
+
+    fn resolve_relative_paths(&mut self, config_path: &Path) {
+        let base = config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        self.runtime.root = resolve_config_relative_path(base, &self.runtime.root);
+        self.audit.path = resolve_config_relative_path(base, &self.audit.path);
+        self.context_compact.transcript_dir =
+            resolve_config_relative_path(base, &self.context_compact.transcript_dir);
+        self.prompt_cache.dir = resolve_config_relative_path(base, &self.prompt_cache.dir);
+        self.metrics.dir = resolve_config_relative_path(base, &self.metrics.dir);
     }
 
     pub fn enabled_sources(&self) -> Vec<&SourceConfig> {
@@ -121,29 +199,9 @@ impl AppConfig {
 }
 
 impl IngestConfig {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read ingest config: {}", path.display()))?;
-        let file: IngestFileConfig = toml::from_str(&content)
-            .with_context(|| format!("failed to parse ingest config: {}", path.display()))?;
-        Ok(file.ingest)
+    pub fn is_empty(&self) -> bool {
+        self.once.sources.is_empty() && self.cron.sources.is_empty()
     }
-
-    pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        if path.exists() {
-            Self::load(path)
-        } else {
-            Ok(Self::default())
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct IngestFileConfig {
-    #[serde(default)]
-    ingest: IngestConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,6 +235,284 @@ pub struct SourceConfig {
     pub max_bytes: usize,
     #[serde(default)]
     pub interval_hours: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActiveKnowledgeBase {
+    pub id: String,
+    pub name: String,
+    pub focus: String,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnowledgeBaseRegistry {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub active_id: Option<String>,
+    #[serde(default)]
+    pub knowledge_bases: Vec<KnowledgeBaseRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeBaseRecord {
+    pub id: String,
+    pub name: String,
+    pub focus: String,
+    pub root: String,
+    pub created_at_unix_ms: u128,
+    pub updated_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeBaseFileConfig {
+    pub name: String,
+    pub focus: String,
+    #[serde(default)]
+    pub ingest: IngestConfig,
+}
+
+impl KnowledgeBaseRegistry {
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self {
+                schema_version: 1,
+                active_id: None,
+                knowledge_bases: Vec::new(),
+            });
+        }
+        let content = fs::read_to_string(path).with_context(|| {
+            format!("failed to read knowledge base registry: {}", path.display())
+        })?;
+        let mut registry: Self = serde_json::from_str(&content).with_context(|| {
+            format!(
+                "failed to parse knowledge base registry: {}",
+                path.display()
+            )
+        })?;
+        if registry.schema_version == 0 {
+            registry.schema_version = 1;
+        }
+        Ok(registry)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create knowledge base registry dir: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let content = serde_json::to_string_pretty(self)
+            .context("failed to serialize knowledge base registry")?;
+        fs::write(path, content).with_context(|| {
+            format!(
+                "failed to write knowledge base registry: {}",
+                path.display()
+            )
+        })
+    }
+}
+
+impl KnowledgeBaseFileConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read knowledge base config: {}", path.display()))?;
+        toml::from_str(&content)
+            .with_context(|| format!("failed to parse knowledge base config: {}", path.display()))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create knowledge base config dir: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let content =
+            toml::to_string_pretty(self).context("failed to serialize knowledge base config")?;
+        fs::write(path, content)
+            .with_context(|| format!("failed to write knowledge base config: {}", path.display()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeBaseCreateInput {
+    pub name: String,
+    pub focus: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeBaseList {
+    pub active_id: Option<String>,
+    pub knowledge_bases: Vec<KnowledgeBaseRecord>,
+}
+
+pub fn list_knowledge_bases(config_path: &Path) -> Result<KnowledgeBaseList> {
+    let config = AppConfig::load_global(config_path)?;
+    let registry = KnowledgeBaseRegistry::load(&config.knowledge_base_registry_path())?;
+    Ok(KnowledgeBaseList {
+        active_id: registry.active_id,
+        knowledge_bases: registry.knowledge_bases,
+    })
+}
+
+pub fn create_knowledge_base(
+    config_path: &Path,
+    input: KnowledgeBaseCreateInput,
+) -> Result<KnowledgeBaseRecord> {
+    let config = AppConfig::load_global(config_path)?;
+    let name = non_empty_trimmed("knowledge base name", &input.name)?;
+    let focus = non_empty_trimmed("knowledge base focus", &input.focus)?;
+    let now = now_unix_ms();
+    let id = unique_knowledge_base_id(&name, now);
+    let root = config.knowledge_bases_root().join(&id);
+    let record = KnowledgeBaseRecord {
+        id: id.clone(),
+        name: name.clone(),
+        focus: focus.clone(),
+        root: root.display().to_string(),
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    };
+
+    fs::create_dir_all(root.join("knowledge").join("approved").join("topics"))
+        .with_context(|| format!("failed to create knowledge base root: {}", root.display()))?;
+    fs::create_dir_all(
+        root.join("knowledge")
+            .join("approved")
+            .join("evidence")
+            .join("source_summaries"),
+    )
+    .with_context(|| {
+        format!(
+            "failed to create knowledge base evidence dirs: {}",
+            root.display()
+        )
+    })?;
+    fs::create_dir_all(
+        root.join("knowledge")
+            .join("approved")
+            .join("evidence")
+            .join("sources"),
+    )
+    .with_context(|| {
+        format!(
+            "failed to create knowledge base source dirs: {}",
+            root.display()
+        )
+    })?;
+    fs::create_dir_all(root.join("knowledge").join("staging").join("candidates")).with_context(
+        || {
+            format!(
+                "failed to create knowledge base staging dirs: {}",
+                root.display()
+            )
+        },
+    )?;
+    fs::create_dir_all(root.join("runtime")).with_context(|| {
+        format!(
+            "failed to create knowledge base runtime dir: {}",
+            root.display()
+        )
+    })?;
+
+    let kb_config = KnowledgeBaseFileConfig {
+        name,
+        focus: focus.clone(),
+        ingest: IngestConfig::default(),
+    };
+    kb_config.save(&root.join(KNOWLEDGE_BASE_CONFIG_FILE))?;
+    let index = format!(
+        "---\ntitle: \"{}\"\naliases: []\ntags: [index]\nsource_ids: []\nsource_urls: []\nversion_hashes: []\n---\n\n# {}\n\nFocus: {}\n",
+        escape_toml_like(&record.name),
+        record.name,
+        focus
+    );
+    fs::write(
+        root.join("knowledge").join("approved").join("index.md"),
+        index,
+    )
+    .with_context(|| format!("failed to write knowledge base index: {}", root.display()))?;
+
+    let registry_path = config.knowledge_base_registry_path();
+    let mut registry = KnowledgeBaseRegistry::load(&registry_path)?;
+    registry.knowledge_bases.push(record.clone());
+    registry.active_id = Some(id);
+    registry.save(&registry_path)?;
+    Ok(record)
+}
+
+pub fn activate_knowledge_base(config_path: &Path, id: &str) -> Result<KnowledgeBaseRecord> {
+    let config = AppConfig::load_global(config_path)?;
+    let trimmed = non_empty_trimmed("knowledge base id", id)?;
+    let registry_path = config.knowledge_base_registry_path();
+    let mut registry = KnowledgeBaseRegistry::load(&registry_path)?;
+    let record = registry
+        .knowledge_bases
+        .iter()
+        .find(|record| record.id == trimmed)
+        .cloned()
+        .with_context(|| format!("knowledge base not found: {trimmed}"))?;
+    registry.active_id = Some(record.id.clone());
+    registry.save(&registry_path)?;
+    Ok(record)
+}
+
+fn non_empty_trimmed(label: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{label} must not be empty");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn resolve_config_relative_path(base: &Path, value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return value.to_string();
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return trimmed.to_string();
+    }
+    base.join(path).display().to_string()
+}
+
+fn unique_knowledge_base_id(name: &str, now: u128) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in name.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() {
+        "knowledge-base"
+    } else {
+        slug
+    };
+    format!("{slug}-{now}")
+}
+
+fn escape_toml_like(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 impl SourceConfig {
@@ -325,7 +661,7 @@ pub struct ResolvedLlmConfig {
 
 pub fn default_config_toml() -> &'static str {
     r#"# Wiki Craft configuration.
-# Ingest sources live in wiki_craft.ingest.toml.
+# Knowledge base sources live in each .wiki_craft/knowledge_bases/{id}/knowledge_base.toml.
 # LLM env vars follow scribe_engine: LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
 
 [llm]
@@ -356,38 +692,6 @@ enabled = true
 dir = ".wiki_craft/runtime/metrics"
 http_bind = "127.0.0.1:9898"
 "#
-}
-
-pub fn default_ingest_config_toml() -> &'static str {
-    r#"# Wiki Craft ingest sources.
-# `cargo run -- ingest --once` reads ingest.once.sources.
-# `cargo run -- serve` reads ingest.cron.sources.
-
-[ingest.once]
-
-[[ingest.once.sources]]
-url = "https://example.com/once"
-enabled = false
-timeout_seconds = 15
-max_bytes = 200000
-
-[ingest.cron]
-
-[[ingest.cron.sources]]
-url = "https://example.com/cron"
-enabled = false
-interval_hours = 24
-timeout_seconds = 15
-max_bytes = 200000
-"#
-}
-
-pub fn ingest_config_path_for(config_path: &Path) -> std::path::PathBuf {
-    config_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(|parent| parent.join(DEFAULT_INGEST_CONFIG_PATH))
-        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_INGEST_CONFIG_PATH))
 }
 
 fn non_empty(value: &str) -> bool {
@@ -495,8 +799,11 @@ mod tests {
 
     #[test]
     fn parses_ingest_source_groups() {
-        let file: IngestFileConfig = toml::from_str(
+        let file: KnowledgeBaseFileConfig = toml::from_str(
             r#"
+name = "Docs"
+focus = "Rust docs"
+
 [ingest.once]
 
 [[ingest.once.sources]]
@@ -531,24 +838,105 @@ enabled = false
     }
 
     #[test]
-    fn app_config_loads_sibling_ingest_config() {
+    fn app_config_loads_active_knowledge_base_config() {
         let root = std::env::temp_dir().join(format!(
             "wiki-craft-config-test-{}",
             crate::support::now_unix_ms()
         ));
         fs::create_dir_all(&root).expect("temp dir");
         let config_path = root.join(DEFAULT_CONFIG_PATH);
-        fs::write(&config_path, "[runtime]\nroot = \".wiki_craft\"\n").expect("main config");
+        let runtime_root = root.join(".wiki_craft");
+        let kb_root = runtime_root.join(KNOWLEDGE_BASES_DIR).join("docs");
         fs::write(
-            root.join(DEFAULT_INGEST_CONFIG_PATH),
-            "[ingest.once]\n\n[[ingest.once.sources]]\nurl = \"https://example.test/once\"\n",
+            &config_path,
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
         )
-        .expect("ingest config");
+        .expect("main config");
+        let registry = KnowledgeBaseRegistry {
+            schema_version: 1,
+            active_id: Some("docs".to_string()),
+            knowledge_bases: vec![KnowledgeBaseRecord {
+                id: "docs".to_string(),
+                name: "Docs".to_string(),
+                focus: "Rust docs".to_string(),
+                root: kb_root.display().to_string(),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            }],
+        };
+        registry
+            .save(
+                &runtime_root
+                    .join(KNOWLEDGE_BASES_DIR)
+                    .join(KNOWLEDGE_BASE_REGISTRY_FILE),
+            )
+            .expect("registry");
+        KnowledgeBaseFileConfig {
+            name: "Docs".to_string(),
+            focus: "Rust docs".to_string(),
+            ingest: toml::from_str::<KnowledgeBaseFileConfig>(
+                "name = \"Docs\"\nfocus = \"Rust docs\"\n[ingest.once]\n\n[[ingest.once.sources]]\nurl = \"https://example.test/once\"\n",
+            )
+            .expect("kb config")
+            .ingest,
+        }
+        .save(&kb_root.join(KNOWLEDGE_BASE_CONFIG_FILE))
+        .expect("knowledge base config");
 
         let cfg = AppConfig::load(&config_path).expect("config");
 
         assert_eq!(cfg.ingest.once.sources.len(), 1);
         assert_eq!(cfg.ingest.once.sources[0].url, "https://example.test/once");
+        assert_eq!(
+            cfg.active_knowledge_base().expect("active").focus,
+            "Rust docs"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_and_activate_knowledge_base_roundtrips_registry() {
+        let root = std::env::temp_dir().join(format!(
+            "wiki-craft-kb-test-{}",
+            crate::support::now_unix_ms()
+        ));
+        fs::create_dir_all(&root).expect("temp dir");
+        let config_path = root.join(DEFAULT_CONFIG_PATH);
+        let runtime_root = root.join(".wiki_craft");
+        fs::write(
+            &config_path,
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
+        )
+        .expect("main config");
+
+        let first = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Product Research".to_string(),
+                focus: "Pricing and integration decisions".to_string(),
+            },
+        )
+        .expect("create first");
+        let second = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Engineering Notes".to_string(),
+                focus: "Implementation details".to_string(),
+            },
+        )
+        .expect("create second");
+
+        let listed = list_knowledge_bases(&config_path).expect("list");
+        assert_eq!(listed.active_id.as_deref(), Some(second.id.as_str()));
+        assert_eq!(listed.knowledge_bases.len(), 2);
+
+        let activated = activate_knowledge_base(&config_path, &first.id).expect("activate");
+        assert_eq!(activated.id, first.id);
+        let cfg = AppConfig::load(&config_path).expect("config");
+        assert_eq!(
+            cfg.active_knowledge_base().expect("active").focus,
+            "Pricing and integration decisions"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

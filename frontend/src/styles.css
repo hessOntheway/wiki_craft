@@ -98,6 +98,130 @@ button {
   box-shadow: 0 1px 2px rgb(24 32 41 / 8%);
 }
 
+.knowledge-base-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 12px;
+}
+
+.knowledge-base-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.knowledge-base-select {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfd;
+  padding: 8px 10px;
+  color: var(--muted);
+}
+
+.knowledge-base-select select {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  outline: 0;
+}
+
+.knowledge-base-focus,
+.knowledge-base-empty {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.knowledge-base-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.knowledge-base-form input,
+.knowledge-base-form textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfd;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  outline: 0;
+  padding: 9px 10px;
+}
+
+.knowledge-base-form textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+
+.skill-panel,
+.skill-form {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skill-form {
+  padding-top: 2px;
+}
+
+.skill-form label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.skill-form label span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.skill-form input,
+.skill-form select {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfd;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  outline: 0;
+  padding: 8px 10px;
+}
+
+.skill-message {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.skill-message.success {
+  color: var(--accent);
+}
+
+.skill-message.error {
+  color: var(--danger);
+}
+
 .eyebrow,
 .section-title {
   margin: 0;
@@ -323,6 +447,7 @@ h2 {
 }
 
 .primary-button,
+.secondary-button,
 .danger-button {
   display: inline-flex;
   min-height: 38px;
@@ -340,6 +465,12 @@ h2 {
 .primary-button {
   background: var(--accent);
   color: white;
+}
+
+.secondary-button {
+  border-color: var(--line);
+  background: var(--surface-muted);
+  color: var(--ink);
 }
 
 .primary-button.merge {

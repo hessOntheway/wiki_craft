@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +18,7 @@ const DEFAULT_SNIPPET_MAX_CHARS: usize = 1200;
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
+    pub knowledge_base_id: Option<String>,
     pub query: String,
     pub top_k: usize,
 }
@@ -90,8 +91,17 @@ pub fn search_configured(config_path: &Path, options: SearchOptions) -> Result<S
         bail!("search query must not be empty");
     }
     let top_k = options.top_k.max(1);
-    let config = AppConfig::load_or_default(config_path)?;
-    let paths = workspace_paths_for_search(config, config_path);
+    let mut config = AppConfig::load_or_default(config_path)?;
+    if let Some(id) = options
+        .knowledge_base_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        config.select_knowledge_base(id)?;
+    }
+    config.active_knowledge_base()?;
+    let paths = WorkspacePaths::from_config(&config);
 
     let manifest = SourceManifest::load(&paths.manifest_path).unwrap_or_default();
     let documents = collect_documents(&paths, &manifest)?;
@@ -157,24 +167,6 @@ pub fn render_text_response(response: &SearchResponse) -> String {
         out.push(indent_snippet(&result.snippet));
     }
     out.join("\n")
-}
-
-fn workspace_paths_for_search(mut config: AppConfig, config_path: &Path) -> WorkspacePaths {
-    if Path::new(&config.runtime.root).is_relative() {
-        config.runtime.root = config_project_root(config_path)
-            .join(&config.runtime.root)
-            .to_string_lossy()
-            .to_string();
-    }
-    WorkspacePaths::from_config(&config)
-}
-
-fn config_project_root(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn collect_documents(
@@ -554,10 +546,14 @@ fn is_cjk(char: char) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::config::{
+        IngestConfig, KNOWLEDGE_BASE_CONFIG_FILE, KNOWLEDGE_BASE_REGISTRY_FILE,
+        KNOWLEDGE_BASES_DIR, KnowledgeBaseFileConfig, KnowledgeBaseRecord, KnowledgeBaseRegistry,
+    };
 
     #[test]
     fn splits_markdown_by_heading_after_frontmatter() {
@@ -589,9 +585,13 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("wiki_craft.toml"),
-            "[runtime]\nroot = \".wiki_craft\"\n",
+            format!(
+                "[runtime]\nroot = \"{}\"\n",
+                root.join(".wiki_craft").display()
+            ),
         )
         .unwrap();
+        write_active_kb_registry(&root.join(".wiki_craft"));
         fs::write(
             root.join(".wiki_craft/knowledge/approved/index.md"),
             "# Index\n\n- [[topics/home|Home]]",
@@ -611,6 +611,7 @@ mod tests {
         let response = search_configured(
             &root.join("wiki_craft.toml"),
             SearchOptions {
+                knowledge_base_id: None,
                 query: "llama".to_string(),
                 top_k: 5,
             },
@@ -627,6 +628,7 @@ mod tests {
         let draft_response = search_configured(
             &root.join("wiki_craft.toml"),
             SearchOptions {
+                knowledge_base_id: None,
                 query: "secret draft term".to_string(),
                 top_k: 5,
             },
@@ -645,9 +647,13 @@ mod tests {
             .unwrap();
         fs::write(
             root.join("wiki_craft.toml"),
-            "[runtime]\nroot = \".wiki_craft\"\n",
+            format!(
+                "[runtime]\nroot = \"{}\"\n",
+                root.join(".wiki_craft").display()
+            ),
         )
         .unwrap();
+        write_active_kb_registry(&root.join(".wiki_craft"));
         fs::write(
             root.join(".wiki_craft/knowledge/approved/index.md"),
             "# Index",
@@ -667,6 +673,7 @@ mod tests {
         let response = search_configured(
             &root.join("wiki_craft.toml"),
             SearchOptions {
+                knowledge_base_id: None,
                 query: "retrieval".to_string(),
                 top_k: 2,
             },
@@ -684,11 +691,121 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn explicit_knowledge_base_id_overrides_active_registry_entry() {
+        let root = unique_temp_dir();
+        let runtime_root = root.join(".wiki_craft");
+        let alpha_root = runtime_root.join("knowledge_bases/alpha");
+        let beta_root = runtime_root.join("knowledge_bases/beta");
+        for kb_root in [&alpha_root, &beta_root] {
+            fs::create_dir_all(kb_root.join("knowledge/approved/topics")).unwrap();
+        }
+        fs::write(
+            root.join("wiki_craft.toml"),
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
+        )
+        .unwrap();
+        write_kb_file(&alpha_root, "Alpha", "Alpha focus");
+        write_kb_file(&beta_root, "Beta", "Beta focus");
+        KnowledgeBaseRegistry {
+            schema_version: 1,
+            active_id: Some("alpha".to_string()),
+            knowledge_bases: vec![
+                KnowledgeBaseRecord {
+                    id: "alpha".to_string(),
+                    name: "Alpha".to_string(),
+                    focus: "Alpha focus".to_string(),
+                    root: alpha_root.display().to_string(),
+                    created_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                },
+                KnowledgeBaseRecord {
+                    id: "beta".to_string(),
+                    name: "Beta".to_string(),
+                    focus: "Beta focus".to_string(),
+                    root: beta_root.display().to_string(),
+                    created_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                },
+            ],
+        }
+        .save(
+            &runtime_root
+                .join(KNOWLEDGE_BASES_DIR)
+                .join(KNOWLEDGE_BASE_REGISTRY_FILE),
+        )
+        .unwrap();
+        fs::write(
+            alpha_root.join("knowledge/approved/index.md"),
+            "# Alpha\n\nalpha-only term",
+        )
+        .unwrap();
+        fs::write(
+            beta_root.join("knowledge/approved/index.md"),
+            "# Beta\n\nbeta-only term",
+        )
+        .unwrap();
+
+        let response = search_configured(
+            &root.join("wiki_craft.toml"),
+            SearchOptions {
+                knowledge_base_id: Some("beta".to_string()),
+                query: "beta-only".to_string(),
+                top_k: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert!(response.results[0].path.contains("knowledge_bases/beta"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn unique_temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("wiki_craft_search_test_{nanos}"))
+    }
+
+    fn write_active_kb_registry(workspace_root: &Path) {
+        let registry = KnowledgeBaseRegistry {
+            schema_version: 1,
+            active_id: Some("test".to_string()),
+            knowledge_bases: vec![KnowledgeBaseRecord {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                focus: "Test focus".to_string(),
+                root: workspace_root.display().to_string(),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            }],
+        };
+        registry
+            .save(
+                &workspace_root
+                    .join(KNOWLEDGE_BASES_DIR)
+                    .join(KNOWLEDGE_BASE_REGISTRY_FILE),
+            )
+            .unwrap();
+        KnowledgeBaseFileConfig {
+            name: "Test".to_string(),
+            focus: "Test focus".to_string(),
+            ingest: IngestConfig::default(),
+        }
+        .save(&workspace_root.join(KNOWLEDGE_BASE_CONFIG_FILE))
+        .unwrap();
+    }
+
+    fn write_kb_file(root: &Path, name: &str, focus: &str) {
+        KnowledgeBaseFileConfig {
+            name: name.to_string(),
+            focus: focus.to_string(),
+            ingest: IngestConfig::default(),
+        }
+        .save(&root.join(KNOWLEDGE_BASE_CONFIG_FILE))
+        .unwrap();
     }
 }

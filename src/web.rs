@@ -16,10 +16,16 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 use crate::candidates::{CandidateMetadata, CandidateStatus};
-use crate::config::{AppConfig, DEFAULT_CONFIG_PATH};
+use crate::config::{
+    AppConfig, DEFAULT_CONFIG_PATH, KnowledgeBaseCreateInput, KnowledgeBaseList,
+    activate_knowledge_base, create_knowledge_base, list_knowledge_bases,
+};
 use crate::knowledge::WorkspacePaths;
 use crate::runtime::{self, ApproveOutcome, StatusSnapshot};
 use crate::search::{SearchOptions, SearchResponse, search_configured};
+use crate::skill::{
+    CreateSkillOptions, CreateSkillOutcome, SkillTarget, create_knowledge_base_skill,
+};
 
 const DEFAULT_SEARCH_TOP_K: usize = 5;
 const MAX_SEARCH_TOP_K: usize = 20;
@@ -43,8 +49,21 @@ struct HealthResponse {
 
 #[derive(Debug, Deserialize)]
 struct SearchParams {
+    knowledge_base: Option<String>,
     query: Option<String>,
     top_k: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateKnowledgeBaseRequest {
+    name: String,
+    focus: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSkillRequest {
+    target: SkillTarget,
+    destination_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +181,13 @@ pub fn api_router(config_path: impl Into<PathBuf>) -> Router {
 fn api_routes() -> Router<WebState> {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/knowledge-bases", get(get_knowledge_bases))
+        .route("/api/knowledge-bases", post(post_knowledge_base))
+        .route(
+            "/api/knowledge-bases/{id}/activate",
+            post(post_activate_knowledge_base),
+        )
+        .route("/api/knowledge-bases/{id}/skill", post(post_create_skill))
         .route("/api/status", get(get_status))
         .route("/api/search", get(get_search))
         .route("/api/candidates", get(list_candidates))
@@ -218,6 +244,61 @@ pub fn config_path_from_env() -> PathBuf {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+async fn get_knowledge_bases(
+    State(state): State<WebState>,
+) -> Result<Json<KnowledgeBaseList>, AppError> {
+    list_knowledge_bases(&state.config_path)
+        .map(Json)
+        .map_err(AppError::internal)
+}
+
+async fn post_knowledge_base(
+    State(state): State<WebState>,
+    Json(payload): Json<CreateKnowledgeBaseRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = create_knowledge_base(
+        &state.config_path,
+        KnowledgeBaseCreateInput {
+            name: payload.name,
+            focus: payload.focus,
+        },
+    )
+    .map_err(|error| AppError::bad_request(format!("{error:#}")))?;
+    Ok(Json(serde_json::json!({ "knowledge_base": record })))
+}
+
+async fn post_activate_knowledge_base(
+    State(state): State<WebState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let record = activate_knowledge_base(&state.config_path, &id)
+        .map_err(|error| AppError::bad_request(format!("{error:#}")))?;
+    Ok(Json(serde_json::json!({ "knowledge_base": record })))
+}
+
+async fn post_create_skill(
+    State(state): State<WebState>,
+    AxumPath(id): AxumPath<String>,
+    Json(payload): Json<CreateSkillRequest>,
+) -> Result<Json<CreateSkillOutcome>, AppError> {
+    let destination_path = payload
+        .destination_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    create_knowledge_base_skill(
+        &state.config_path,
+        CreateSkillOptions {
+            knowledge_base_id: id,
+            target: payload.target,
+            destination_path,
+        },
+    )
+    .map(Json)
+    .map_err(|error| AppError::bad_request(format!("{error:#}")))
 }
 
 fn discover_default_config_path() -> Option<PathBuf> {
@@ -288,6 +369,7 @@ async fn get_search(
     search_configured(
         &state.config_path,
         SearchOptions {
+            knowledge_base_id: params.knowledge_base,
             query: query.to_string(),
             top_k,
         },
@@ -608,7 +690,10 @@ mod tests {
 
     use super::*;
     use crate::candidates::{CandidateMetadata, CandidatePaths};
-    use crate::config::AppConfig;
+    use crate::config::{
+        AppConfig, IngestConfig, KNOWLEDGE_BASE_CONFIG_FILE, KNOWLEDGE_BASE_REGISTRY_FILE,
+        KNOWLEDGE_BASES_DIR, KnowledgeBaseFileConfig, KnowledgeBaseRecord, KnowledgeBaseRegistry,
+    };
     use crate::knowledge::WorkspacePaths;
     use crate::search::SearchResponse;
     use crate::sources::{ChangedSource, SourceManifest};
@@ -642,7 +727,37 @@ mod tests {
         let config_path = root.join("wiki_craft.toml");
         fs::create_dir_all(root).expect("root");
         fs::write(&config_path, toml::to_string_pretty(&config).expect("toml")).expect("config");
+        write_active_kb_registry(&root.join(".wiki_craft"));
         config_path
+    }
+
+    fn write_active_kb_registry(workspace_root: &Path) {
+        let registry = KnowledgeBaseRegistry {
+            schema_version: 1,
+            active_id: Some("test".to_string()),
+            knowledge_bases: vec![KnowledgeBaseRecord {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                focus: "Test focus".to_string(),
+                root: workspace_root.display().to_string(),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            }],
+        };
+        registry
+            .save(
+                &workspace_root
+                    .join(KNOWLEDGE_BASES_DIR)
+                    .join(KNOWLEDGE_BASE_REGISTRY_FILE),
+            )
+            .expect("registry");
+        KnowledgeBaseFileConfig {
+            name: "Test".to_string(),
+            focus: "Test focus".to_string(),
+            ingest: IngestConfig::default(),
+        }
+        .save(&workspace_root.join(KNOWLEDGE_BASE_CONFIG_FILE))
+        .expect("knowledge base config");
     }
 
     fn changed_source() -> ChangedSource {
@@ -848,5 +963,36 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(response.expect("search response").results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_skill_endpoint_writes_skill_to_custom_destination() {
+        let root = temp_root("skill");
+        let config_path = write_search_fixture(&root);
+        let destination = root.join("generated-skills");
+        let body = serde_json::json!({
+            "target": "custom",
+            "destination_path": destination.display().to_string(),
+        })
+        .to_string();
+        let response = api_router(config_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/knowledge-bases/test/skill")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let outcome = serde_json::from_slice::<CreateSkillOutcome>(&bytes).unwrap();
+        let skill_md = fs::read_to_string(Path::new(&outcome.skill_path).join("SKILL.md"))
+            .expect("generated skill");
+        assert!(skill_md.contains("--knowledge-base 'test'"));
+        assert!(skill_md.contains("Focus: Test focus"));
     }
 }

@@ -17,17 +17,21 @@ Wiki Craft intentionally keeps the storage model simple: no vector database, no 
 cargo run -- init
 ```
 
-Create local config files from the example templates:
+Create the global local config from the example template:
 
 ```bash
 cp wiki_craft_example.toml wiki_craft.toml
-cp wiki_craft.ingest_example.toml wiki_craft.ingest.toml
 ```
 
-Then edit `wiki_craft.toml` and `wiki_craft.ingest.toml` for your own LLM and
-source settings.
+Then create a knowledge base. The focus is required because Wiki Craft uses it when summarizing sources and generating topic pages:
 
-Edit `wiki_craft.ingest.toml`, enable at least one source, and configure these three environment variables:
+```bash
+cargo run -- knowledge-base create \
+  --name "Product Research" \
+  --focus "Long-lived product research notes, pricing changes, and integration decisions"
+```
+
+Configure these three environment variables:
 
 ```bash
 export LLM_API_KEY="..."
@@ -35,9 +39,12 @@ export LLM_BASE_URL="..."
 export LLM_MODEL="..."
 ```
 
+Edit the active knowledge base config under `.wiki_craft/knowledge_bases/{id}/knowledge_base.toml`, enable at least one source, and then run ingest. See `knowledge_base_example.toml` for the per-knowledge-base source shape.
+
 Typical workflow:
 
 ```bash
+cargo run -- knowledge-base list
 cargo run -- ingest --once
 cargo run -- candidates list
 cargo run -- candidates summaries <run_id>
@@ -63,6 +70,9 @@ cargo run -- serve
 
 Wiki Craft also includes a local Tauri desktop GUI for reviewing staged candidates. It uses the same approval model as the CLI:
 
+- Create a knowledge base from the sidebar, including the required focus statement.
+- Switch the active knowledge base from the sidebar. Review, search, ingest, and candidate actions operate on the active knowledge base only.
+- Use `Create Skill` in the knowledge-base panel to generate a Codex/Claude-compatible `SKILL.md` for the selected knowledge base.
 - `summaries_staged`: review changed source summaries, then approve summaries to generate a candidate knowledge diff.
 - `diff_ready`: review the colorized `diff.md`, then merge the accepted diff into approved knowledge.
 - Reject remains explicit and removes the staged candidate without changing approved knowledge.
@@ -92,9 +102,9 @@ GUI and service logs are separate from the LLM audit log:
 
 Search is implemented in `src/search.rs`. It is local, read-only, and searches only approved content:
 
-- `.wiki_craft/knowledge/approved/index.md`
-- `.wiki_craft/knowledge/approved/topics/*.md`
-- `.wiki_craft/knowledge/approved/evidence/source_summaries/*.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/index.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/topics/*.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/*.md`
 
 It never reads staged candidates. A candidate may contain useful draft knowledge, but it is not authoritative until approved.
 
@@ -102,21 +112,27 @@ It never reads staged candidates. A candidate may contain useful draft knowledge
 cargo run -- search --query "<question>" --top-k 5 --json
 ```
 
+Agents can target a specific knowledge base without changing the active GUI/CLI selection:
+
+```bash
+cargo run -- search --knowledge-base "<knowledge_base_id>" --query "<question>" --top-k 5 --json
+```
+
 Text output is for humans. JSON output is for agents and tooling.
 
 ### Inputs
 
-Search resolves workspace paths from `wiki_craft.toml`. If `runtime.root` is relative, it is resolved relative to the config file directory. Search then loads the source manifest if it exists.
+Search resolves the active knowledge base from `.wiki_craft/knowledge_bases/registry.json` unless `--knowledge-base <id>` is provided, then loads that knowledge base's source manifest if it exists.
 
-The manifest enriches source-summary results. For example, when searching `.wiki_craft/knowledge/approved/evidence/source_summaries/{source_id}.md`, Wiki Craft can add the original source URL and content hash from `.wiki_craft/knowledge/approved/evidence/sources/manifest.json`.
+The manifest enriches source-summary results. For example, when searching `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/{source_id}.md`, Wiki Craft can add the original source URL and content hash from `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/sources/manifest.json`.
 
 ### Document Collection
 
 Search collects three result kinds:
 
-- `index`: `.wiki_craft/knowledge/approved/index.md`
-- `topic`: `.wiki_craft/knowledge/approved/topics/*.md`
-- `source_summary`: `.wiki_craft/knowledge/approved/evidence/source_summaries/*.md`
+- `index`: `.wiki_craft/knowledge_bases/{id}/knowledge/approved/index.md`
+- `topic`: `.wiki_craft/knowledge_bases/{id}/knowledge/approved/topics/*.md`
+- `source_summary`: `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/*.md`
 
 Each Markdown file is parsed into:
 
@@ -193,9 +209,12 @@ Search indexes these approved Markdown files at query time.
 
 ### Source Configuration
 
-One-time and periodic sources are configured separately in `wiki_craft.ingest.toml`:
+One-time and periodic sources are configured per knowledge base in `.wiki_craft/knowledge_bases/{id}/knowledge_base.toml`:
 
 ```toml
+name = "Product Research"
+focus = "Long-lived product research notes, pricing changes, and integration decisions."
+
 [ingest.once]
 
 [[ingest.once.sources]]
@@ -215,6 +234,8 @@ max_bytes = 200000
 ```
 
 `cargo run -- ingest --once` fetches only enabled `ingest.once.sources`. `cargo run -- serve` fetches only enabled `ingest.cron.sources` whose per-source `interval_hours` is due. Each source only needs a `url`; if `interval_hours` is omitted, it defaults to 24 hours.
+
+Only the active knowledge base is ingested. Use `cargo run -- knowledge-base activate <id>` or the GUI selector to switch.
 
 ### Fetching
 
@@ -248,7 +269,7 @@ Whitespace normalization makes trivial formatting differences less likely to cre
 The source manifest lives at:
 
 ```text
-.wiki_craft/knowledge/approved/evidence/sources/manifest.json
+.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/sources/manifest.json
 ```
 
 It stores one `SourceRecord` per `source_id`, including configured URL, final URL, title, `etag`, `last_modified`, `content_hash`, `version_key`, fetch timestamps, latest candidate run ID, and summary path.
@@ -257,14 +278,14 @@ A source is considered changed if there is no previous record or if the previous
 
 ### Source Summaries
 
-For each changed source, the LLM receives the source URL, final URL, title, version hash, and fetched readable text.
+For each changed source, the LLM receives the active knowledge base focus, source URL, final URL, title, version hash, and fetched readable text.
 
-The summarizer prompt requires the model to treat source text as untrusted evidence, ignore instructions inside the source, write concise Markdown in the source/user language, include key claims and workflows, record useful keywords, mark conflicts or uncertainty, and avoid long raw passages.
+The summarizer prompt requires the model to treat source text as untrusted evidence, ignore instructions inside the source, use the knowledge base focus to decide what matters, write concise Markdown in the source/user language, include key claims and workflows, record useful keywords, mark conflicts or uncertainty, and avoid long raw passages.
 
 The generated summary is written to:
 
 ```text
-.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/{source_id}.md
+.wiki_craft/knowledge_bases/{id}/knowledge/staging/candidates/{run_id}/evidence/source_summaries/{source_id}.md
 ```
 
 Ingest writes only the changed source summaries into the candidate. Final merge copies those changed summaries into the approved source-summary directory, preserving already approved summaries that were not part of the candidate.
@@ -347,8 +368,8 @@ The first approval does not modify approved knowledge or approved source summari
 
 The merge step promotes:
 
-- `.wiki_craft/knowledge/staging/candidates/{run_id}/knowledge/` to `.wiki_craft/knowledge/approved/`
-- `.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` to `.wiki_craft/knowledge/approved/evidence/source_summaries/`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/staging/candidates/{run_id}/knowledge/` to `.wiki_craft/knowledge_bases/{id}/knowledge/approved/`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` to `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/`
 
 Rejecting a candidate is also explicit:
 
@@ -370,7 +391,7 @@ Use this command to convert existing approved Markdown into a candidate topic-fi
 cargo run -- knowledge reorganize
 ```
 
-This command reads `.wiki_craft/knowledge/approved/`, splits existing Markdown conservatively by headings, creates candidate `index.md` and `topics/*.md`, writes `diff.md` and `metadata.json`, and leaves approved knowledge unchanged.
+This command reads the active knowledge base's approved vault, splits existing Markdown conservatively by headings, creates candidate `index.md` and `topics/*.md`, writes `diff.md` and `metadata.json`, and leaves approved knowledge unchanged.
 
 Review and merge it like any ingest candidate.
 

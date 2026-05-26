@@ -7,7 +7,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    AppConfig, default_config_toml, default_ingest_config_toml, ingest_config_path_for,
+    AppConfig, KNOWLEDGE_BASE_REGISTRY_FILE, KnowledgeBaseRegistry, default_config_toml,
 };
 use crate::support::markdown_heading;
 
@@ -253,6 +253,9 @@ pub(crate) fn build_reorganized_vault(current_knowledge: &str, run_id: &str) -> 
 #[derive(Debug, Clone)]
 pub struct WorkspacePaths {
     pub root: PathBuf,
+    pub knowledge_base_id: Option<String>,
+    pub knowledge_base_name: Option<String>,
+    pub knowledge_base_focus: Option<String>,
     pub sources_dir: PathBuf,
     pub source_summaries_current: PathBuf,
     pub knowledge_current: PathBuf,
@@ -271,7 +274,11 @@ pub struct WorkspacePaths {
 
 impl WorkspacePaths {
     pub fn from_config(config: &AppConfig) -> Self {
-        let root = PathBuf::from(&config.runtime.root);
+        let root = config
+            .knowledge_base
+            .as_ref()
+            .map(|knowledge_base| PathBuf::from(&knowledge_base.root))
+            .unwrap_or_else(|| PathBuf::from(&config.runtime.root));
         let approved_knowledge = root.join("knowledge").join("approved");
         let approved_evidence = approved_knowledge.join("evidence");
         let sources_dir = approved_evidence.join("sources");
@@ -295,6 +302,18 @@ impl WorkspacePaths {
             metrics_events_path: metrics_dir.join("events.jsonl"),
             metrics_dir,
             status_path: root.join("runtime").join("status.json"),
+            knowledge_base_id: config
+                .knowledge_base
+                .as_ref()
+                .map(|knowledge_base| knowledge_base.id.clone()),
+            knowledge_base_name: config
+                .knowledge_base
+                .as_ref()
+                .map(|knowledge_base| knowledge_base.name.clone()),
+            knowledge_base_focus: config
+                .knowledge_base
+                .as_ref()
+                .map(|knowledge_base| knowledge_base.focus.clone()),
             root,
             sources_dir,
         }
@@ -323,7 +342,6 @@ impl WorkspacePaths {
 #[derive(Debug, Clone, Serialize)]
 pub struct InitReport {
     pub config_path: String,
-    pub ingest_config_path: String,
     pub schema_path: String,
     pub runtime_root: String,
     pub created: Vec<String>,
@@ -332,20 +350,12 @@ pub struct InitReport {
 
 pub fn initialize_project(config_path: &Path) -> Result<InitReport> {
     let config = AppConfig::load_or_default(config_path)?;
-    let paths = WorkspacePaths::from_config(&config);
     let mut created = Vec::new();
     let mut existing = Vec::new();
 
     write_if_missing(
         config_path,
         default_config_toml(),
-        &mut created,
-        &mut existing,
-    )?;
-    let ingest_config_path = ingest_config_path_for(config_path);
-    write_if_missing(
-        &ingest_config_path,
-        default_ingest_config_toml(),
         &mut created,
         &mut existing,
     )?;
@@ -356,14 +366,28 @@ pub fn initialize_project(config_path: &Path) -> Result<InitReport> {
         &mut existing,
     )?;
 
-    paths.ensure_all()?;
-    created.push(paths.root.display().to_string());
+    let registry_path = PathBuf::from(&config.runtime.root)
+        .join(crate::config::KNOWLEDGE_BASES_DIR)
+        .join(KNOWLEDGE_BASE_REGISTRY_FILE);
+    if !registry_path.exists() {
+        KnowledgeBaseRegistry {
+            schema_version: 1,
+            active_id: None,
+            knowledge_bases: Vec::new(),
+        }
+        .save(&registry_path)?;
+        created.push(registry_path.display().to_string());
+    } else {
+        existing.push(registry_path.display().to_string());
+    }
+    fs::create_dir_all(PathBuf::from(&config.runtime.root).join("runtime"))
+        .with_context(|| format!("failed to create runtime root: {}", config.runtime.root))?;
+    created.push(config.runtime.root.clone());
 
     Ok(InitReport {
         config_path: config_path.display().to_string(),
-        ingest_config_path: ingest_config_path.display().to_string(),
         schema_path: DEFAULT_SCHEMA_PATH.to_string(),
-        runtime_root: paths.root.display().to_string(),
+        runtime_root: config.runtime.root,
         created,
         existing,
     })
@@ -399,11 +423,11 @@ This file is the human-readable operating contract for the Wiki Craft knowledge 
 
 AI coding tools should read approved knowledge from:
 
-- `.wiki_craft/knowledge/approved/index.md`
-- `.wiki_craft/knowledge/approved/topics/*.md`
-- `.wiki_craft/knowledge/approved/evidence/source_summaries/`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/index.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/topics/*.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/`
 
-Candidate updates live under `.wiki_craft/knowledge/staging/candidates/{run_id}/` and are not authoritative until approved.
+Candidate updates live under `.wiki_craft/knowledge_bases/{id}/knowledge/staging/candidates/{run_id}/` and are not authoritative until approved.
 
 ## Maintenance Rules
 
@@ -415,11 +439,11 @@ Candidate updates live under `.wiki_craft/knowledge/staging/candidates/{run_id}/
 
 ## Vault Layout
 
-- `.wiki_craft/knowledge/approved/index.md` is the approved wiki entry point.
-- `.wiki_craft/knowledge/approved/topics/*.md` contains topic-first Obsidian-style pages.
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/index.md` is the approved wiki entry point.
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/topics/*.md` contains topic-first Obsidian-style pages.
 - Topic pages should use YAML frontmatter with `title`, `aliases`, `tags`, `source_ids`, `source_urls`, `version_hashes`, and `updated_at_run_id`.
 - Source summaries should include key claims, methods or workflows, useful keywords, and diagrams only when they clarify the material.
-- Claude Code, Codex, and similar tools should begin by reading this file and `.wiki_craft/knowledge/approved/index.md`, then follow wikilinks into topic pages.
+- Claude Code, Codex, and similar tools should begin by reading this file and the active knowledge base `index.md`, then follow wikilinks into topic pages.
 "#
 }
 

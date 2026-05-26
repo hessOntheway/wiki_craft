@@ -1,6 +1,5 @@
-# Wiki Craft ingest sources.
-# `cargo run -- ingest --once` reads ingest.once.sources.
-# `cargo run -- serve` reads ingest.cron.sources.
+name = "Example Knowledge Base"
+focus = "Describe the durable topic, audience, and retrieval goal for this knowledge base."
 
 [ingest.once]
 

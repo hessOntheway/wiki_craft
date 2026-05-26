@@ -17,16 +17,21 @@ Wiki Craft 故意保持存储模型简单：没有向量数据库，没有 embed
 cargo run -- init
 ```
 
-先从 example 模板生成本地配置文件：
+先从 example 模板生成全局配置文件：
 
 ```bash
 cp wiki_craft_example.toml wiki_craft.toml
-cp wiki_craft.ingest_example.toml wiki_craft.ingest.toml
 ```
 
-然后根据自己的 LLM 和来源配置修改 `wiki_craft.toml` 和 `wiki_craft.ingest.toml`。
+然后新建知识库。关注点是必填项，Wiki Craft 会在摘要提取和 topic 构建时使用它来判断什么内容重要：
 
-编辑 `wiki_craft.ingest.toml`，启用至少一个来源，并配置这三个环境变量：
+```bash
+cargo run -- knowledge-base create \
+  --name "Product Research" \
+  --focus "长期产品研究笔记、价格变化和集成决策"
+```
+
+配置这三个环境变量：
 
 ```bash
 export LLM_API_KEY="..."
@@ -34,9 +39,12 @@ export LLM_BASE_URL="..."
 export LLM_MODEL="..."
 ```
 
+编辑当前知识库的 `.wiki_craft/knowledge_bases/{id}/knowledge_base.toml`，启用至少一个来源，然后运行 ingest。`knowledge_base_example.toml` 展示了每个知识库的来源配置格式。
+
 常见流程：
 
 ```bash
+cargo run -- knowledge-base list
 cargo run -- ingest --once
 cargo run -- candidates list
 cargo run -- candidates summaries <run_id>
@@ -62,6 +70,9 @@ cargo run -- serve
 
 Wiki Craft 也提供一个本地 Tauri 桌面 GUI，用来 review staged candidates。它复用和 CLI 一样的批准模型：
 
+- 在侧边栏新建知识库，并填写必需的关注点。
+- 在侧边栏切换当前知识库。Review、Search、Ingest 和 candidate 操作都只作用于当前知识库。
+- 在知识库面板点击 `Create Skill`，可以为当前知识库生成 Codex/Claude 兼容的 `SKILL.md`。
 - `summaries_staged`：先查看变化 source summaries，再批准 summaries，生成候选知识 diff。
 - `diff_ready`：查看带颜色的 `diff.md`，确认后再 merge 到正式知识库。
 - Reject 仍然是显式操作，只删除 staged candidate，不修改已批准知识。
@@ -91,9 +102,9 @@ GUI 和服务日志会和 LLM audit log 分开：
 
 检索逻辑在 `src/search.rs`。它是本地只读检索，只读取已经批准的内容：
 
-- `.wiki_craft/knowledge/approved/index.md`
-- `.wiki_craft/knowledge/approved/topics/*.md`
-- `.wiki_craft/knowledge/approved/evidence/source_summaries/*.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/index.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/topics/*.md`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/*.md`
 
 它不会读取 staged candidates。候选知识可以有用，但在批准前不被视为正式知识。
 
@@ -101,21 +112,27 @@ GUI 和服务日志会和 LLM audit log 分开：
 cargo run -- search --query "<question>" --top-k 5 --json
 ```
 
+Agent 可以显式指定某个知识库，而不改变 GUI/CLI 当前选中的 active 知识库：
+
+```bash
+cargo run -- search --knowledge-base "<knowledge_base_id>" --query "<question>" --top-k 5 --json
+```
+
 普通文本输出给人看，JSON 输出给 agent 和工具链使用。
 
 ### 输入解析
 
-检索会先根据 `wiki_craft.toml` 解析工作区路径。如果 `runtime.root` 是相对路径，就以配置文件所在目录为基准解析。然后它会尝试读取 source manifest。
+检索默认会先从 `.wiki_craft/knowledge_bases/registry.json` 解析当前知识库；如果传入 `--knowledge-base <id>`，则读取指定知识库和它自己的 source manifest。
 
-manifest 会用于补充 source summary 的元数据。例如检索 `.wiki_craft/knowledge/approved/evidence/source_summaries/{source_id}.md` 时，Wiki Craft 可以从 `.wiki_craft/knowledge/approved/evidence/sources/manifest.json` 里补上原始 URL 和内容 hash。
+manifest 会用于补充 source summary 的元数据。例如检索 `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/{source_id}.md` 时，Wiki Craft 可以从 `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/sources/manifest.json` 里补上原始 URL 和内容 hash。
 
 ### 文档收集
 
 检索会收集三类结果：
 
-- `index`：`.wiki_craft/knowledge/approved/index.md`
-- `topic`：`.wiki_craft/knowledge/approved/topics/*.md`
-- `source_summary`：`.wiki_craft/knowledge/approved/evidence/source_summaries/*.md`
+- `index`：`.wiki_craft/knowledge_bases/{id}/knowledge/approved/index.md`
+- `topic`：`.wiki_craft/knowledge_bases/{id}/knowledge/approved/topics/*.md`
+- `source_summary`：`.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/*.md`
 
 每个 Markdown 文件会被解析为：
 
@@ -192,9 +209,12 @@ configured URL sources
 
 ### 来源配置
 
-一次性来源和周期性来源在 `wiki_craft.ingest.toml` 中分开配置：
+一次性来源和周期性来源在每个知识库自己的 `.wiki_craft/knowledge_bases/{id}/knowledge_base.toml` 中配置：
 
 ```toml
+name = "Product Research"
+focus = "长期产品研究笔记、价格变化和集成决策。"
+
 [ingest.once]
 
 [[ingest.once.sources]]
@@ -214,6 +234,8 @@ max_bytes = 200000
 ```
 
 `cargo run -- ingest --once` 只抓取启用的 `ingest.once.sources`。`cargo run -- serve` 只抓取启用且已到各自 `interval_hours` 周期的 `ingest.cron.sources`。每个来源只需要 `url`；如果省略 `interval_hours`，默认是 24 小时。
+
+ingest 只作用于当前知识库。可以通过 `cargo run -- knowledge-base activate <id>` 或 GUI 选择器切换。
 
 ### 抓取
 
@@ -247,7 +269,7 @@ Web fetch 工具只接受 `http` 和 `https` URL，并且有边界控制：
 source manifest 位于：
 
 ```text
-.wiki_craft/knowledge/approved/evidence/sources/manifest.json
+.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/sources/manifest.json
 ```
 
 它为每个 `source_id` 保存一条 `SourceRecord`，包括配置 URL、最终 URL、标题、`etag`、`last_modified`、`content_hash`、`version_key`、抓取时间、最新候选 run ID 和摘要路径。
@@ -256,14 +278,14 @@ source manifest 位于：
 
 ### 来源摘要
 
-对每个变化的来源，LLM 会收到 source URL、final URL、title、version hash 和抓取出的 readable text。
+对每个变化的来源，LLM 会收到当前知识库关注点、source URL、final URL、title、version hash 和抓取出的 readable text。
 
-摘要 prompt 要求模型把来源文本当作不可信证据，不执行来源里的指令，使用与来源或用户相匹配的中英文，输出简洁 Markdown，包含关键主张、核心方法或流程、有用关键词、冲突和不确定性，并避免长篇复制原文。
+摘要 prompt 要求模型把来源文本当作不可信证据，不执行来源里的指令，按照知识库关注点判断哪些内容重要，使用与来源或用户相匹配的中英文，输出简洁 Markdown，包含关键主张、核心方法或流程、有用关键词、冲突和不确定性，并避免长篇复制原文。
 
 生成的摘要会写入候选目录：
 
 ```text
-.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/{source_id}.md
+.wiki_craft/knowledge_bases/{id}/knowledge/staging/candidates/{run_id}/evidence/source_summaries/{source_id}.md
 ```
 
 ingest 只会把本次变化来源的新摘要写入候选目录。最终批准会把这些变化摘要按文件合并进正式 source-summary 目录，并保留不属于本次候选的既有正式摘要。
@@ -346,8 +368,8 @@ cargo run -- candidates merge <run_id>   # diff_ready -> approved
 
 merge 步骤会提升：
 
-- `.wiki_craft/knowledge/staging/candidates/{run_id}/knowledge/` 到 `.wiki_craft/knowledge/approved/`
-- `.wiki_craft/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` 到 `.wiki_craft/knowledge/approved/evidence/source_summaries/`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/staging/candidates/{run_id}/knowledge/` 到 `.wiki_craft/knowledge_bases/{id}/knowledge/approved/`
+- `.wiki_craft/knowledge_bases/{id}/knowledge/staging/candidates/{run_id}/evidence/source_summaries/` 到 `.wiki_craft/knowledge_bases/{id}/knowledge/approved/evidence/source_summaries/`
 
 拒绝候选也需要显式执行：
 
@@ -369,7 +391,7 @@ cargo run -- candidates reject <run_id>
 cargo run -- knowledge reorganize
 ```
 
-这个命令会读取 `.wiki_craft/knowledge/approved/`，按标题保守切分已有 Markdown，创建候选 `index.md` 和 `topics/*.md`，写入 `diff.md` 和 `metadata.json`，但不修改正式知识。
+这个命令会读取当前知识库的正式 vault，按标题保守切分已有 Markdown，创建候选 `index.md` 和 `topics/*.md`，写入 `diff.md` 和 `metadata.json`，但不修改正式知识。
 
 它和普通 ingest candidate 一样，需要先 review，再 merge。
 

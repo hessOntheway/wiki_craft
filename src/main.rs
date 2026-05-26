@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use wiki_craft::config::DEFAULT_CONFIG_PATH;
+use wiki_craft::config::{
+    DEFAULT_CONFIG_PATH, KnowledgeBaseCreateInput, activate_knowledge_base, create_knowledge_base,
+    list_knowledge_bases,
+};
 use wiki_craft::knowledge::initialize_project;
 use wiki_craft::runtime;
 use wiki_craft::search::{SearchOptions, render_text_response, search_configured};
@@ -34,6 +37,8 @@ enum Command {
     },
     Search {
         #[arg(long)]
+        knowledge_base: Option<String>,
+        #[arg(long)]
         query: String,
         #[arg(long, default_value_t = 5)]
         top_k: usize,
@@ -54,6 +59,10 @@ enum Command {
         #[command(subcommand)]
         command: KnowledgeCommand,
     },
+    KnowledgeBase {
+        #[command(subcommand)]
+        command: KnowledgeBaseCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +78,20 @@ enum CandidateCommand {
 #[derive(Debug, Subcommand)]
 enum KnowledgeCommand {
     Reorganize,
+}
+
+#[derive(Debug, Subcommand)]
+enum KnowledgeBaseCommand {
+    List,
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        focus: String,
+    },
+    Activate {
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -109,8 +132,20 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Search { query, top_k, json } => {
-            let response = search_configured(&cli.config, SearchOptions { query, top_k })?;
+        Command::Search {
+            knowledge_base,
+            query,
+            top_k,
+            json,
+        } => {
+            let response = search_configured(
+                &cli.config,
+                SearchOptions {
+                    knowledge_base_id: knowledge_base,
+                    query,
+                    top_k,
+                },
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
@@ -154,6 +189,21 @@ fn main() -> Result<()> {
             KnowledgeCommand::Reorganize => {
                 let outcome = runtime::reorganize(&cli.config)?;
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
+            }
+        },
+        Command::KnowledgeBase { command } => match command {
+            KnowledgeBaseCommand::List => {
+                let knowledge_bases = list_knowledge_bases(&cli.config)?;
+                println!("{}", serde_json::to_string_pretty(&knowledge_bases)?);
+            }
+            KnowledgeBaseCommand::Create { name, focus } => {
+                let record =
+                    create_knowledge_base(&cli.config, KnowledgeBaseCreateInput { name, focus })?;
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            }
+            KnowledgeBaseCommand::Activate { id } => {
+                let record = activate_knowledge_base(&cli.config, &id)?;
+                println!("activated {}", record.id);
             }
         },
     }

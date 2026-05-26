@@ -3,11 +3,14 @@ import type { ReactNode } from "react";
 import {
   Check,
   CircleAlert,
+  Database,
   FileDiff,
   FileText,
   GitMerge,
   LoaderCircle,
+  Plus,
   RefreshCw,
+  Save,
   Search,
   Trash2,
 } from "lucide-react";
@@ -16,6 +19,7 @@ type CandidateStatus = "summaries_staged" | "diff_ready" | "approved";
 type TabKey = "summaries" | "diff" | "metadata";
 type PageMode = "review" | "search";
 type SearchResultKind = "index" | "topic" | "source_summary";
+type SkillTarget = "codex" | "claude" | "custom";
 
 interface ChangedSource {
   source_id: string;
@@ -56,6 +60,30 @@ interface CandidateDetail {
   actions: CandidateActions;
   summaries_markdown: string;
   diff_markdown?: string | null;
+}
+
+interface KnowledgeBaseRecord {
+  id: string;
+  name: string;
+  focus: string;
+  root: string;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+}
+
+interface KnowledgeBaseListResponse {
+  active_id?: string | null;
+  knowledge_bases: KnowledgeBaseRecord[];
+}
+
+interface KnowledgeBaseCreateResponse {
+  knowledge_base: KnowledgeBaseRecord;
+}
+
+interface CreateSkillResponse {
+  skill_name: string;
+  skill_path: string;
+  message: string;
 }
 
 interface StatusSnapshot {
@@ -127,6 +155,8 @@ export function App() {
   const [pageMode, setPageMode] = useState<PageMode>("review");
   const [apiBaseUrl, setApiBaseUrl] = useState("");
   const [status, setStatus] = useState<StatusSnapshot | null>(null);
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRecord[]>([]);
+  const [activeKnowledgeBaseId, setActiveKnowledgeBaseId] = useState<string | null>(null);
   const [candidates, setCandidates] = useState<CandidateMetadata[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [detail, setDetail] = useState<CandidateDetail | null>(null);
@@ -141,6 +171,16 @@ export function App() {
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [searchSearched, setSearchSearched] = useState(false);
+  const [showKnowledgeBaseForm, setShowKnowledgeBaseForm] = useState(false);
+  const [newKnowledgeBaseName, setNewKnowledgeBaseName] = useState("");
+  const [newKnowledgeBaseFocus, setNewKnowledgeBaseFocus] = useState("");
+  const [knowledgeBaseCreating, setKnowledgeBaseCreating] = useState(false);
+  const [showSkillForm, setShowSkillForm] = useState(false);
+  const [skillTarget, setSkillTarget] = useState<SkillTarget>("codex");
+  const [skillCustomPath, setSkillCustomPath] = useState("");
+  const [skillCreating, setSkillCreating] = useState(false);
+  const [skillMessage, setSkillMessage] = useState("");
+  const [skillError, setSkillError] = useState("");
 
   const apiUrl = useCallback(
     (path: string) => (apiBaseUrl ? `${apiBaseUrl}${path}` : path),
@@ -197,10 +237,17 @@ export function App() {
   const refresh = useCallback(
     async (preferredRunId?: string) => {
       setLastError("");
-      const [nextStatus, nextCandidates] = await Promise.all([
-        requestJson<StatusSnapshot>("/api/status"),
-        requestJson<CandidateMetadata[]>("/api/candidates"),
-      ]);
+      const nextKnowledgeBases = await requestJson<KnowledgeBaseListResponse>("/api/knowledge-bases");
+      setKnowledgeBases(nextKnowledgeBases.knowledge_bases);
+      setActiveKnowledgeBaseId(nextKnowledgeBases.active_id || null);
+      if (!nextKnowledgeBases.active_id) {
+        setStatus(null);
+        setCandidates([]);
+        setSelectedRunId("");
+        setDetail(null);
+        return;
+      }
+      const [nextStatus, nextCandidates] = await Promise.all([requestJson<StatusSnapshot>("/api/status"), requestJson<CandidateMetadata[]>("/api/candidates")]);
       setStatus(nextStatus);
       setCandidates(nextCandidates);
 
@@ -223,6 +270,102 @@ export function App() {
     },
     [activeTab, requestJson],
   );
+
+  const activeKnowledgeBase = useMemo(
+    () => knowledgeBases.find((knowledgeBase) => knowledgeBase.id === activeKnowledgeBaseId) || null,
+    [activeKnowledgeBaseId, knowledgeBases],
+  );
+
+  const createKnowledgeBase = async () => {
+    const name = newKnowledgeBaseName.trim();
+    const focus = newKnowledgeBaseFocus.trim();
+    setLastError("");
+    setLastMessage("");
+    if (!name || !focus) {
+      setLastError("Knowledge base name and focus are required.");
+      return;
+    }
+    setKnowledgeBaseCreating(true);
+    try {
+      const response = await requestJson<KnowledgeBaseCreateResponse>("/api/knowledge-bases", {
+        method: "POST",
+        body: JSON.stringify({ name, focus }),
+      });
+      setNewKnowledgeBaseName("");
+      setNewKnowledgeBaseFocus("");
+      setShowKnowledgeBaseForm(false);
+      setSearchResponse(null);
+      setSearchSearched(false);
+      setLastMessage(`Knowledge base created: ${response.knowledge_base.name}`);
+      await refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      void logGuiEvent("error", "knowledge_base_create_failed", { error: message });
+      setLastError(message);
+    } finally {
+      setKnowledgeBaseCreating(false);
+    }
+  };
+
+  const activateKnowledgeBase = async (id: string) => {
+    if (!id || id === activeKnowledgeBaseId) {
+      return;
+    }
+    setLastError("");
+    setLastMessage("");
+    try {
+      await requestJson<KnowledgeBaseCreateResponse>(`/api/knowledge-bases/${encodeURIComponent(id)}/activate`, { method: "POST" });
+      setSearchResponse(null);
+      setSearchSearched(false);
+      await refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      void logGuiEvent("error", "knowledge_base_activate_failed", { id, error: message });
+      setLastError(message);
+    }
+  };
+
+  const createSkill = async () => {
+    if (!activeKnowledgeBase) {
+      return;
+    }
+    setSkillError("");
+    setSkillMessage("");
+    const customPath = skillCustomPath.trim();
+    if (skillTarget === "custom" && !customPath) {
+      setSkillError("Custom destination path is required.");
+      return;
+    }
+    setSkillCreating(true);
+    try {
+      const response = await requestJson<CreateSkillResponse>(
+        `/api/knowledge-bases/${encodeURIComponent(activeKnowledgeBase.id)}/skill`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            target: skillTarget,
+            destination_path: skillTarget === "custom" ? customPath : undefined,
+          }),
+        },
+      );
+      setSkillMessage(`Skill created: ${response.skill_path}`);
+      await logGuiEvent("info", "skill_create_completed", {
+        knowledgeBaseId: activeKnowledgeBase.id,
+        target: skillTarget,
+        skillPath: response.skill_path,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSkillError(message);
+      void logGuiEvent("error", "skill_create_failed", {
+        knowledgeBaseId: activeKnowledgeBase.id,
+        target: skillTarget,
+        error: message,
+      });
+    } finally {
+      setSkillCreating(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -435,6 +578,83 @@ export function App() {
           </button>
         </nav>
 
+        <section className="knowledge-base-panel" aria-label="Knowledge bases">
+          <div className="knowledge-base-head">
+            <span className="section-title">Knowledge Base</span>
+            <button className="icon-button" type="button" onClick={() => setShowKnowledgeBaseForm((value) => !value)} title="New knowledge base">
+              <Plus size={17} />
+            </button>
+          </div>
+          {knowledgeBases.length > 0 ? (
+            <label className="knowledge-base-select">
+              <Database size={16} />
+              <select value={activeKnowledgeBaseId || ""} onChange={(event) => void activateKnowledgeBase(event.target.value)}>
+                {knowledgeBases.map((knowledgeBase) => (
+                  <option value={knowledgeBase.id} key={knowledgeBase.id}>
+                    {knowledgeBase.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : (
+            <p className="knowledge-base-empty">No knowledge base yet.</p>
+          )}
+          {activeKnowledgeBase && <p className="knowledge-base-focus">{activeKnowledgeBase.focus}</p>}
+          {showKnowledgeBaseForm && (
+            <form
+              className="knowledge-base-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createKnowledgeBase();
+              }}
+            >
+              <input value={newKnowledgeBaseName} onChange={(event) => setNewKnowledgeBaseName(event.target.value)} placeholder="Name" />
+              <textarea value={newKnowledgeBaseFocus} onChange={(event) => setNewKnowledgeBaseFocus(event.target.value)} placeholder="Focus" rows={4} />
+              <button className="primary-button" type="submit" disabled={knowledgeBaseCreating}>
+                {knowledgeBaseCreating ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}
+                Create
+              </button>
+            </form>
+          )}
+          {activeKnowledgeBase && (
+            <div className="skill-panel">
+              <button className="secondary-button" type="button" onClick={() => setShowSkillForm((value) => !value)}>
+                <Save size={16} />
+                Create Skill
+              </button>
+              {showSkillForm && (
+                <form
+                  className="skill-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void createSkill();
+                  }}
+                >
+                  <label>
+                    <span>Destination</span>
+                    <select value={skillTarget} onChange={(event) => setSkillTarget(event.target.value as SkillTarget)}>
+                      <option value="codex">Codex default</option>
+                      <option value="claude">Claude default</option>
+                      <option value="custom">Custom path</option>
+                    </select>
+                  </label>
+                  {skillTarget === "custom" && (
+                    <label>
+                      <span>Path</span>
+                      <input value={skillCustomPath} onChange={(event) => setSkillCustomPath(event.target.value)} placeholder="~/path/to/skills" />
+                    </label>
+                  )}
+                  <button className="primary-button" type="submit" disabled={skillCreating}>
+                    {skillCreating ? <LoaderCircle className="spin" size={17} /> : <Save size={17} />}
+                    Generate
+                  </button>
+                  {(skillError || skillMessage) && <p className={`skill-message ${skillError ? "error" : "success"}`}>{skillError || skillMessage}</p>}
+                </form>
+              )}
+            </div>
+          )}
+        </section>
+
         <section className="status-strip" aria-label="Runtime status">
           <StatusLine label="Pending" value={String(status?.pending_candidates ?? 0)} />
           <StatusLine label="Candidates" value={String(candidates.length)} />
@@ -482,7 +702,7 @@ export function App() {
       <main className="workspace">
         <header className="workspace-header">
           <div>
-            <p className="eyebrow">{pageMode === "review" ? "Candidate" : "Approved Knowledge"}</p>
+            <p className="eyebrow">{activeKnowledgeBase?.name || "No Knowledge Base"}</p>
             <h2>{pageMode === "review" ? selectedCandidate?.run_id || "No candidate selected" : "Search"}</h2>
           </div>
           {pageMode === "review" && (

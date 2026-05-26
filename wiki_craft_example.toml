@@ -1,5 +1,5 @@
 # Wiki Craft configuration.
-# Ingest sources live in wiki_craft.ingest.toml.
+# Knowledge base sources live in each .wiki_craft/knowledge_bases/{id}/knowledge_base.toml.
 # LLM environment variables follow scribe_engine:
 # LLM_API_KEY, LLM_BASE_URL, LLM_MODEL.
 

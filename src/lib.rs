@@ -4,6 +4,7 @@ pub mod knowledge;
 pub mod llm;
 pub mod runtime;
 pub mod search;
+pub mod skill;
 pub mod sources;
 pub(crate) mod support;
 pub mod tools;
