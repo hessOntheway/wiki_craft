@@ -347,6 +347,11 @@ pub struct KnowledgeBaseCreateInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeBaseDeleteInput {
+    pub confirmation_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeBaseList {
     pub active_id: Option<String>,
     pub knowledge_bases: Vec<KnowledgeBaseRecord>,
@@ -463,12 +468,109 @@ pub fn activate_knowledge_base(config_path: &Path, id: &str) -> Result<Knowledge
     Ok(record)
 }
 
+pub fn delete_knowledge_base(
+    config_path: &Path,
+    id: &str,
+    input: KnowledgeBaseDeleteInput,
+) -> Result<KnowledgeBaseList> {
+    let config = AppConfig::load_global(config_path)?;
+    let trimmed = non_empty_trimmed("knowledge base id", id)?;
+    let registry_path = config.knowledge_base_registry_path();
+    let mut registry = KnowledgeBaseRegistry::load(&registry_path)?;
+    let index = registry
+        .knowledge_bases
+        .iter()
+        .position(|record| record.id == trimmed)
+        .with_context(|| format!("knowledge base not found: {trimmed}"))?;
+    let record = registry.knowledge_bases[index].clone();
+    if input.confirmation_name.trim() != record.name {
+        anyhow::bail!("knowledge base name confirmation did not match");
+    }
+
+    let root = PathBuf::from(&record.root);
+    ensure_deletable_knowledge_base_root(&root, &config.knowledge_bases_root())?;
+    if root.exists() {
+        fs::remove_dir_all(&root).with_context(|| {
+            format!(
+                "failed to delete knowledge base directory: {}",
+                root.display()
+            )
+        })?;
+    }
+
+    registry.knowledge_bases.remove(index);
+    if registry.active_id.as_deref() == Some(record.id.as_str()) {
+        registry.active_id = registry
+            .knowledge_bases
+            .first()
+            .map(|knowledge_base| knowledge_base.id.clone());
+    }
+    registry.save(&registry_path)?;
+
+    Ok(KnowledgeBaseList {
+        active_id: registry.active_id,
+        knowledge_bases: registry.knowledge_bases,
+    })
+}
+
 fn non_empty_trimmed(label: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{label} must not be empty");
     }
     Ok(trimmed.to_string())
+}
+
+fn ensure_deletable_knowledge_base_root(root: &Path, knowledge_bases_root: &Path) -> Result<()> {
+    if contains_parent_component(root) || contains_parent_component(knowledge_bases_root) {
+        anyhow::bail!("knowledge base root contains unsupported parent path components");
+    }
+
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let absolute_root = absolutize(&cwd, root);
+    let absolute_base = absolutize(&cwd, knowledge_bases_root);
+    if absolute_root == absolute_base || !absolute_root.starts_with(&absolute_base) {
+        anyhow::bail!(
+            "refusing to delete knowledge base outside configured knowledge_bases root: {}",
+            root.display()
+        );
+    }
+
+    if absolute_root.exists() {
+        let canonical_root = fs::canonicalize(&absolute_root).with_context(|| {
+            format!(
+                "failed to resolve knowledge base root: {}",
+                absolute_root.display()
+            )
+        })?;
+        let canonical_base = fs::canonicalize(&absolute_base).with_context(|| {
+            format!(
+                "failed to resolve configured knowledge_bases root: {}",
+                absolute_base.display()
+            )
+        })?;
+        if canonical_root == canonical_base || !canonical_root.starts_with(&canonical_base) {
+            anyhow::bail!(
+                "refusing to delete knowledge base outside configured knowledge_bases root: {}",
+                root.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn contains_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 fn resolve_config_relative_path(base: &Path, value: &str) -> String {
@@ -937,6 +1039,220 @@ enabled = false
             cfg.active_knowledge_base().expect("active").focus,
             "Pricing and integration decisions"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_inactive_knowledge_base_removes_dir_and_keeps_active() {
+        let root = std::env::temp_dir().join(format!(
+            "wiki-craft-kb-delete-inactive-test-{}",
+            crate::support::now_unix_ms()
+        ));
+        fs::create_dir_all(&root).expect("temp dir");
+        let config_path = root.join(DEFAULT_CONFIG_PATH);
+        let runtime_root = root.join(".wiki_craft");
+        fs::write(
+            &config_path,
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
+        )
+        .expect("main config");
+
+        let first = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "First".to_string(),
+                focus: "First focus".to_string(),
+            },
+        )
+        .expect("create first");
+        let second = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Second".to_string(),
+                focus: "Second focus".to_string(),
+            },
+        )
+        .expect("create second");
+        let first_root = PathBuf::from(&first.root);
+
+        let listed = delete_knowledge_base(
+            &config_path,
+            &first.id,
+            KnowledgeBaseDeleteInput {
+                confirmation_name: "First".to_string(),
+            },
+        )
+        .expect("delete");
+
+        assert!(!first_root.exists());
+        assert_eq!(listed.active_id.as_deref(), Some(second.id.as_str()));
+        assert_eq!(listed.knowledge_bases.len(), 1);
+        assert_eq!(listed.knowledge_bases[0].id, second.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_active_knowledge_base_selects_first_remaining() {
+        let root = std::env::temp_dir().join(format!(
+            "wiki-craft-kb-delete-active-test-{}",
+            crate::support::now_unix_ms()
+        ));
+        fs::create_dir_all(&root).expect("temp dir");
+        let config_path = root.join(DEFAULT_CONFIG_PATH);
+        let runtime_root = root.join(".wiki_craft");
+        fs::write(
+            &config_path,
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
+        )
+        .expect("main config");
+
+        let first = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "First".to_string(),
+                focus: "First focus".to_string(),
+            },
+        )
+        .expect("create first");
+        let second = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Second".to_string(),
+                focus: "Second focus".to_string(),
+            },
+        )
+        .expect("create second");
+
+        let listed = delete_knowledge_base(
+            &config_path,
+            &second.id,
+            KnowledgeBaseDeleteInput {
+                confirmation_name: "Second".to_string(),
+            },
+        )
+        .expect("delete active");
+
+        assert_eq!(listed.active_id.as_deref(), Some(first.id.as_str()));
+        assert_eq!(listed.knowledge_bases.len(), 1);
+        assert_eq!(listed.knowledge_bases[0].id, first.id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_last_knowledge_base_clears_active() {
+        let root = std::env::temp_dir().join(format!(
+            "wiki-craft-kb-delete-last-test-{}",
+            crate::support::now_unix_ms()
+        ));
+        fs::create_dir_all(&root).expect("temp dir");
+        let config_path = root.join(DEFAULT_CONFIG_PATH);
+        let runtime_root = root.join(".wiki_craft");
+        fs::write(
+            &config_path,
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
+        )
+        .expect("main config");
+
+        let only = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Only".to_string(),
+                focus: "Only focus".to_string(),
+            },
+        )
+        .expect("create only");
+
+        let listed = delete_knowledge_base(
+            &config_path,
+            &only.id,
+            KnowledgeBaseDeleteInput {
+                confirmation_name: "Only".to_string(),
+            },
+        )
+        .expect("delete only");
+
+        assert_eq!(listed.active_id, None);
+        assert!(listed.knowledge_bases.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_knowledge_base_rejects_mismatched_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "wiki-craft-kb-delete-confirm-test-{}",
+            crate::support::now_unix_ms()
+        ));
+        fs::create_dir_all(&root).expect("temp dir");
+        let config_path = root.join(DEFAULT_CONFIG_PATH);
+        let runtime_root = root.join(".wiki_craft");
+        fs::write(
+            &config_path,
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
+        )
+        .expect("main config");
+
+        let only = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Exact Name".to_string(),
+                focus: "Focus".to_string(),
+            },
+        )
+        .expect("create only");
+        let kb_root = PathBuf::from(&only.root);
+
+        let result = delete_knowledge_base(
+            &config_path,
+            &only.id,
+            KnowledgeBaseDeleteInput {
+                confirmation_name: "exact name".to_string(),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(kb_root.exists());
+        let listed = list_knowledge_bases(&config_path).expect("list");
+        assert_eq!(listed.active_id.as_deref(), Some(only.id.as_str()));
+        assert_eq!(listed.knowledge_bases.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_knowledge_base_cleans_registry_when_dir_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "wiki-craft-kb-delete-missing-dir-test-{}",
+            crate::support::now_unix_ms()
+        ));
+        fs::create_dir_all(&root).expect("temp dir");
+        let config_path = root.join(DEFAULT_CONFIG_PATH);
+        let runtime_root = root.join(".wiki_craft");
+        fs::write(
+            &config_path,
+            format!("[runtime]\nroot = \"{}\"\n", runtime_root.display()),
+        )
+        .expect("main config");
+
+        let only = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Missing Dir".to_string(),
+                focus: "Focus".to_string(),
+            },
+        )
+        .expect("create only");
+        fs::remove_dir_all(&only.root).expect("manual delete");
+
+        let listed = delete_knowledge_base(
+            &config_path,
+            &only.id,
+            KnowledgeBaseDeleteInput {
+                confirmation_name: "Missing Dir".to_string(),
+            },
+        )
+        .expect("delete missing dir");
+
+        assert_eq!(listed.active_id, None);
+        assert!(listed.knowledge_bases.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

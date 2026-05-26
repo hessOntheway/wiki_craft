@@ -175,6 +175,9 @@ export function App() {
   const [newKnowledgeBaseName, setNewKnowledgeBaseName] = useState("");
   const [newKnowledgeBaseFocus, setNewKnowledgeBaseFocus] = useState("");
   const [knowledgeBaseCreating, setKnowledgeBaseCreating] = useState(false);
+  const [showKnowledgeBaseDelete, setShowKnowledgeBaseDelete] = useState(false);
+  const [deleteKnowledgeBaseName, setDeleteKnowledgeBaseName] = useState("");
+  const [knowledgeBaseDeleting, setKnowledgeBaseDeleting] = useState(false);
   const [showSkillForm, setShowSkillForm] = useState(false);
   const [skillTarget, setSkillTarget] = useState<SkillTarget>("codex");
   const [skillCustomPath, setSkillCustomPath] = useState("");
@@ -294,6 +297,8 @@ export function App() {
       setNewKnowledgeBaseName("");
       setNewKnowledgeBaseFocus("");
       setShowKnowledgeBaseForm(false);
+      setShowKnowledgeBaseDelete(false);
+      setDeleteKnowledgeBaseName("");
       setSearchResponse(null);
       setSearchSearched(false);
       setLastMessage(`Knowledge base created: ${response.knowledge_base.name}`);
@@ -315,6 +320,8 @@ export function App() {
     setLastMessage("");
     try {
       await requestJson<KnowledgeBaseCreateResponse>(`/api/knowledge-bases/${encodeURIComponent(id)}/activate`, { method: "POST" });
+      setShowKnowledgeBaseDelete(false);
+      setDeleteKnowledgeBaseName("");
       setSearchResponse(null);
       setSearchSearched(false);
       await refresh();
@@ -322,6 +329,52 @@ export function App() {
       const message = error instanceof Error ? error.message : String(error);
       void logGuiEvent("error", "knowledge_base_activate_failed", { id, error: message });
       setLastError(message);
+    }
+  };
+
+  const deleteKnowledgeBase = async () => {
+    if (!activeKnowledgeBase) {
+      return;
+    }
+    const confirmationName = deleteKnowledgeBaseName.trim();
+    setLastError("");
+    setLastMessage("");
+    if (confirmationName !== activeKnowledgeBase.name) {
+      setLastError("Knowledge base name confirmation did not match.");
+      return;
+    }
+    setKnowledgeBaseDeleting(true);
+    try {
+      await requestJson<KnowledgeBaseListResponse>(`/api/knowledge-bases/${encodeURIComponent(activeKnowledgeBase.id)}`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirmation_name: confirmationName }),
+      });
+      const deletedName = activeKnowledgeBase.name;
+      setShowKnowledgeBaseDelete(false);
+      setDeleteKnowledgeBaseName("");
+      setSearchResponse(null);
+      setSearchSearched(false);
+      setCandidates([]);
+      setStatus(null);
+      setSelectedRunId("");
+      setDetail(null);
+      setActiveTab("summaries");
+      setLastMessage(`Knowledge base deleted: ${deletedName}`);
+      await logGuiEvent("info", "knowledge_base_delete_completed", {
+        knowledgeBaseId: activeKnowledgeBase.id,
+        knowledgeBaseName: deletedName,
+      });
+      await refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      void logGuiEvent("error", "knowledge_base_delete_failed", {
+        knowledgeBaseId: activeKnowledgeBase.id,
+        knowledgeBaseName: activeKnowledgeBase.name,
+        error: message,
+      });
+      setLastError(message);
+    } finally {
+      setKnowledgeBaseDeleting(false);
     }
   };
 
@@ -581,9 +634,35 @@ export function App() {
         <section className="knowledge-base-panel" aria-label="Knowledge bases">
           <div className="knowledge-base-head">
             <span className="section-title">Knowledge Base</span>
-            <button className="icon-button" type="button" onClick={() => setShowKnowledgeBaseForm((value) => !value)} title="New knowledge base">
-              <Plus size={17} />
-            </button>
+            <div className="knowledge-base-actions">
+              {activeKnowledgeBase && (
+                <button
+                  className="icon-button danger-icon-button"
+                  type="button"
+                  onClick={() => {
+                    setShowKnowledgeBaseDelete((value) => !value);
+                    setDeleteKnowledgeBaseName("");
+                    setShowKnowledgeBaseForm(false);
+                  }}
+                  title="Delete knowledge base"
+                  disabled={knowledgeBaseDeleting}
+                >
+                  <Trash2 size={17} />
+                </button>
+              )}
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => {
+                  setShowKnowledgeBaseForm((value) => !value);
+                  setShowKnowledgeBaseDelete(false);
+                  setDeleteKnowledgeBaseName("");
+                }}
+                title="New knowledge base"
+              >
+                <Plus size={17} />
+              </button>
+            </div>
           </div>
           {knowledgeBases.length > 0 ? (
             <label className="knowledge-base-select">
@@ -600,6 +679,41 @@ export function App() {
             <p className="knowledge-base-empty">No knowledge base yet.</p>
           )}
           {activeKnowledgeBase && <p className="knowledge-base-focus">{activeKnowledgeBase.focus}</p>}
+          {activeKnowledgeBase && showKnowledgeBaseDelete && (
+            <form
+              className="knowledge-base-delete-confirm"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void deleteKnowledgeBase();
+              }}
+            >
+              <p>
+                Type <strong>{activeKnowledgeBase.name}</strong> to delete this knowledge base.
+              </p>
+              <input
+                value={deleteKnowledgeBaseName}
+                onChange={(event) => setDeleteKnowledgeBaseName(event.target.value)}
+                placeholder={activeKnowledgeBase.name}
+              />
+              <div className="knowledge-base-delete-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => {
+                    setShowKnowledgeBaseDelete(false);
+                    setDeleteKnowledgeBaseName("");
+                  }}
+                  disabled={knowledgeBaseDeleting}
+                >
+                  Cancel
+                </button>
+                <button className="danger-button" type="submit" disabled={knowledgeBaseDeleting || deleteKnowledgeBaseName.trim() !== activeKnowledgeBase.name}>
+                  {knowledgeBaseDeleting ? <LoaderCircle className="spin" size={17} /> : <Trash2 size={17} />}
+                  Delete
+                </button>
+              </div>
+            </form>
+          )}
           {showKnowledgeBaseForm && (
             <form
               className="knowledge-base-form"

@@ -10,15 +10,16 @@ use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 use crate::candidates::{CandidateMetadata, CandidateStatus};
 use crate::config::{
-    AppConfig, DEFAULT_CONFIG_PATH, KnowledgeBaseCreateInput, KnowledgeBaseList,
-    activate_knowledge_base, create_knowledge_base, list_knowledge_bases,
+    AppConfig, DEFAULT_CONFIG_PATH, KnowledgeBaseCreateInput, KnowledgeBaseDeleteInput,
+    KnowledgeBaseList, activate_knowledge_base, create_knowledge_base, delete_knowledge_base,
+    list_knowledge_bases,
 };
 use crate::knowledge::WorkspacePaths;
 use crate::runtime::{self, ApproveOutcome, StatusSnapshot};
@@ -58,6 +59,11 @@ struct SearchParams {
 struct CreateKnowledgeBaseRequest {
     name: String,
     focus: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteKnowledgeBaseRequest {
+    confirmation_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +193,10 @@ fn api_routes() -> Router<WebState> {
             "/api/knowledge-bases/{id}/activate",
             post(post_activate_knowledge_base),
         )
+        .route(
+            "/api/knowledge-bases/{id}",
+            delete(delete_knowledge_base_handler),
+        )
         .route("/api/knowledge-bases/{id}/skill", post(post_create_skill))
         .route("/api/status", get(get_status))
         .route("/api/search", get(get_search))
@@ -276,6 +286,22 @@ async fn post_activate_knowledge_base(
     let record = activate_knowledge_base(&state.config_path, &id)
         .map_err(|error| AppError::bad_request(format!("{error:#}")))?;
     Ok(Json(serde_json::json!({ "knowledge_base": record })))
+}
+
+async fn delete_knowledge_base_handler(
+    State(state): State<WebState>,
+    AxumPath(id): AxumPath<String>,
+    Json(payload): Json<DeleteKnowledgeBaseRequest>,
+) -> Result<Json<KnowledgeBaseList>, AppError> {
+    delete_knowledge_base(
+        &state.config_path,
+        &id,
+        KnowledgeBaseDeleteInput {
+            confirmation_name: payload.confirmation_name,
+        },
+    )
+    .map(Json)
+    .map_err(|error| AppError::bad_request(format!("{error:#}")))
 }
 
 async fn post_create_skill(
@@ -692,7 +718,8 @@ mod tests {
     use crate::candidates::{CandidateMetadata, CandidatePaths};
     use crate::config::{
         AppConfig, IngestConfig, KNOWLEDGE_BASE_CONFIG_FILE, KNOWLEDGE_BASE_REGISTRY_FILE,
-        KNOWLEDGE_BASES_DIR, KnowledgeBaseFileConfig, KnowledgeBaseRecord, KnowledgeBaseRegistry,
+        KNOWLEDGE_BASES_DIR, KnowledgeBaseCreateInput, KnowledgeBaseFileConfig,
+        KnowledgeBaseRecord, KnowledgeBaseRegistry, create_knowledge_base,
     };
     use crate::knowledge::WorkspacePaths;
     use crate::search::SearchResponse;
@@ -822,6 +849,29 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn delete_response(
+        router: Router,
+        uri: String,
+        confirmation_name: &str,
+    ) -> (StatusCode, String) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "confirmation_name": confirmation_name }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
     async fn search_response(router: Router, uri: &str) -> (StatusCode, Option<SearchResponse>) {
@@ -994,5 +1044,71 @@ mod tests {
             .expect("generated skill");
         assert!(skill_md.contains("--knowledge-base 'test'"));
         assert!(skill_md.contains("Focus: Test focus"));
+    }
+
+    #[tokio::test]
+    async fn delete_knowledge_base_endpoint_returns_updated_list() {
+        let root = temp_root("delete-kb");
+        fs::create_dir_all(&root).expect("root");
+        let config = test_config(&root);
+        let config_path = root.join("wiki_craft.toml");
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml")).expect("config");
+        let first = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "First".to_string(),
+                focus: "First focus".to_string(),
+            },
+        )
+        .expect("create first");
+        let second = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Second".to_string(),
+                focus: "Second focus".to_string(),
+            },
+        )
+        .expect("create second");
+
+        let (status, body) = delete_response(
+            api_router(config_path),
+            format!("/api/knowledge-bases/{}", second.id),
+            "Second",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let list = serde_json::from_str::<KnowledgeBaseList>(&body).expect("list");
+        assert_eq!(list.active_id.as_deref(), Some(first.id.as_str()));
+        assert_eq!(list.knowledge_bases.len(), 1);
+        assert_eq!(list.knowledge_bases[0].id, first.id);
+        assert!(!Path::new(&second.root).exists());
+    }
+
+    #[tokio::test]
+    async fn delete_knowledge_base_endpoint_rejects_wrong_confirmation() {
+        let root = temp_root("delete-kb-confirm");
+        fs::create_dir_all(&root).expect("root");
+        let config = test_config(&root);
+        let config_path = root.join("wiki_craft.toml");
+        fs::write(&config_path, toml::to_string_pretty(&config).expect("toml")).expect("config");
+        let record = create_knowledge_base(
+            &config_path,
+            KnowledgeBaseCreateInput {
+                name: "Exact".to_string(),
+                focus: "Focus".to_string(),
+            },
+        )
+        .expect("create");
+
+        let (status, _body) = delete_response(
+            api_router(config_path),
+            format!("/api/knowledge-bases/{}", record.id),
+            "exact",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(Path::new(&record.root).exists());
     }
 }

@@ -115,6 +115,12 @@ button {
   gap: 10px;
 }
 
+.knowledge-base-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .knowledge-base-select {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -145,14 +151,16 @@ button {
   line-height: 1.45;
 }
 
-.knowledge-base-form {
+.knowledge-base-form,
+.knowledge-base-delete-confirm {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
 .knowledge-base-form input,
-.knowledge-base-form textarea {
+.knowledge-base-form textarea,
+.knowledge-base-delete-confirm input {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -167,6 +175,30 @@ button {
 .knowledge-base-form textarea {
   min-height: 92px;
   resize: vertical;
+}
+
+.knowledge-base-delete-confirm {
+  border: 1px solid #ffc3bd;
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+  padding: 10px;
+}
+
+.knowledge-base-delete-confirm p {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.knowledge-base-delete-confirm strong {
+  color: var(--ink);
+}
+
+.knowledge-base-delete-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .skill-panel,
@@ -306,6 +338,17 @@ h2 {
 .icon-button:hover:not(:disabled) {
   border-color: var(--line-strong);
   color: var(--ink);
+}
+
+.danger-icon-button {
+  border-color: #ffc3bd;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.danger-icon-button:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .candidate-list {
