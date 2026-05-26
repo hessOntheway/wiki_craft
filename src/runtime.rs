@@ -27,7 +27,8 @@ use crate::llm::openai::{OpenAiCompatClient, extract_message_text};
 use crate::llm::session::ConversationSession;
 use crate::llm::usage::PromptCacheStats;
 use crate::sources::{
-    ChangedSource, FetchedSource, SourceManifest, fetched_from_output, source_id_for_url,
+    ChangedSource, FetchedSource, SourceManifest, fetched_from_local_file, fetched_from_output,
+    source_id_for_url,
 };
 use crate::support::audit::{
     append_event, candidate_error_event, compaction_event, tool_call_event, tool_result_event,
@@ -554,9 +555,10 @@ pub(crate) fn run_ingest_for_sources(
         return Ok(outcome);
     }
 
-    let mut manifest = SourceManifest::load(&paths.manifest_path)?;
     let mut fetched_changed = Vec::<FetchedSource>::new();
+    let mut fetched_unchanged = Vec::<FetchedSource>::new();
     let mut checked = 0usize;
+    let manifest = SourceManifest::load(&paths.manifest_path)?;
 
     for source in enabled_sources {
         checked += 1;
@@ -565,8 +567,56 @@ pub(crate) fn run_ingest_for_sources(
         if manifest.is_changed(&fetched) {
             fetched_changed.push(fetched);
         } else {
-            manifest.upsert_fetched(&fetched, None, None);
+            fetched_unchanged.push(fetched);
         }
+    }
+
+    run_ingest_for_fetched_sources(
+        paths,
+        generator,
+        fetched_changed,
+        fetched_unchanged,
+        checked,
+        "all enabled sources are unchanged",
+    )
+}
+
+pub(crate) fn run_ingest_local_file_with_generator(
+    config: &AppConfig,
+    paths: &WorkspacePaths,
+    file_path: &Path,
+    generator: &mut dyn KnowledgeGenerator,
+) -> Result<IngestOutcome> {
+    config.active_knowledge_base()?;
+    paths.ensure_all()?;
+    let fetched = fetched_from_local_file(file_path)?;
+    let manifest = SourceManifest::load(&paths.manifest_path)?;
+    let (fetched_changed, fetched_unchanged) = if manifest.is_changed(&fetched) {
+        (vec![fetched], Vec::new())
+    } else {
+        (Vec::new(), vec![fetched])
+    };
+    run_ingest_for_fetched_sources(
+        paths,
+        generator,
+        fetched_changed,
+        fetched_unchanged,
+        1,
+        "local file source is unchanged",
+    )
+}
+
+fn run_ingest_for_fetched_sources(
+    paths: &WorkspacePaths,
+    generator: &mut dyn KnowledgeGenerator,
+    fetched_changed: Vec<FetchedSource>,
+    fetched_unchanged: Vec<FetchedSource>,
+    checked: usize,
+    unchanged_message: &str,
+) -> Result<IngestOutcome> {
+    let mut manifest = SourceManifest::load(&paths.manifest_path)?;
+    for fetched in fetched_unchanged {
+        manifest.upsert_fetched(&fetched, None, None);
     }
 
     if fetched_changed.is_empty() {
@@ -576,7 +626,7 @@ pub(crate) fn run_ingest_for_sources(
             run_id: None,
             changed_sources: Vec::new(),
             checked_sources: checked,
-            message: "all enabled sources are unchanged".to_string(),
+            message: unchanged_message.to_string(),
         };
         write_status(paths, Some(outcome.clone()), generator.telemetry())?;
         return Ok(outcome);
@@ -739,6 +789,17 @@ pub fn run_production_ingest(config_path: &Path) -> Result<IngestOutcome> {
     let paths = WorkspacePaths::from_config(&config);
     let mut generator = LazyLlmKnowledgeGenerator::new(config.clone(), paths.clone());
     run_ingest_with_generator(&config, &paths, &mut generator)
+}
+
+pub fn run_production_ingest_local_file(
+    config_path: &Path,
+    file_path: &Path,
+) -> Result<IngestOutcome> {
+    let config = AppConfig::load(config_path)?;
+    config.active_knowledge_base()?;
+    let paths = WorkspacePaths::from_config(&config);
+    let mut generator = LazyLlmKnowledgeGenerator::new(config.clone(), paths.clone());
+    run_ingest_local_file_with_generator(&config, &paths, file_path, &mut generator)
 }
 
 pub fn run_production_cron_ingest(config_path: &Path) -> Result<IngestOutcome> {
@@ -1203,7 +1264,7 @@ fn write_http_response(
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, CronIngestConfig, IngestConfig, KNOWLEDGE_BASE_CONFIG_FILE,
+        ActiveKnowledgeBase, AppConfig, CronIngestConfig, IngestConfig, KNOWLEDGE_BASE_CONFIG_FILE,
         KNOWLEDGE_BASE_REGISTRY_FILE, KNOWLEDGE_BASES_DIR, KnowledgeBaseFileConfig,
         KnowledgeBaseRecord, KnowledgeBaseRegistry, OnceIngestConfig, SourceConfig,
     };
@@ -1371,6 +1432,223 @@ mod tests {
         assert!(!candidate.diff.exists());
         let metadata = load_candidate_metadata(&paths, &run_id).expect("metadata");
         assert_eq!(metadata.status, CandidateStatus::SummariesStaged);
+    }
+
+    #[test]
+    fn local_file_ingest_creates_summary_candidate() {
+        let root = unique_temp_dir("wiki-craft-local-file-ingest-test");
+        fs::create_dir_all(&root).expect("test root");
+        let source_path = root.join("notes.md");
+        fs::write(&source_path, "# Local Notes\n\nhello world").expect("source file");
+        let cfg = active_kb_config(&root);
+        let paths = WorkspacePaths::from_config(&cfg);
+        let mut generator = FakeGenerator::new();
+
+        let outcome =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect("local file ingest");
+
+        assert!(matches!(outcome.kind, IngestOutcomeKind::CandidateCreated));
+        assert_eq!(outcome.checked_sources, 1);
+        let changed = outcome.changed_sources.first().expect("changed source");
+        assert!(changed.url.starts_with("file://"));
+        assert_eq!(changed.url, changed.final_url.clone().unwrap());
+        assert_eq!(changed.title.as_deref(), Some("notes.md"));
+        let run_id = outcome.run_id.expect("candidate run id");
+        let candidate = CandidatePaths::new(&paths, &run_id);
+        assert!(
+            candidate
+                .source_summaries
+                .join(format!("{}.md", changed.source_id))
+                .exists()
+        );
+        let metadata = load_candidate_metadata(&paths, &run_id).expect("metadata");
+        assert_eq!(metadata.status, CandidateStatus::SummariesStaged);
+        assert_eq!(metadata.changed_sources.len(), 1);
+        let manifest = SourceManifest::load(&paths.manifest_path).expect("manifest");
+        let record = manifest
+            .sources
+            .get(&changed.source_id)
+            .expect("local source record");
+        assert_eq!(record.url, changed.url);
+        assert_eq!(
+            record.pending_content_hash.as_deref(),
+            Some(changed.new_hash.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_file_ingest_skips_same_pending_content() {
+        let root = unique_temp_dir("wiki-craft-local-file-unchanged-test");
+        fs::create_dir_all(&root).expect("test root");
+        let source_path = root.join("notes.txt");
+        fs::write(&source_path, "hello world").expect("source file");
+        let cfg = active_kb_config(&root);
+        let paths = WorkspacePaths::from_config(&cfg);
+        let mut generator = FakeGenerator::new();
+
+        let first =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect("first local file ingest");
+        assert!(matches!(first.kind, IngestOutcomeKind::CandidateCreated));
+        let second =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect("second local file ingest");
+
+        assert!(matches!(second.kind, IngestOutcomeKind::Unchanged));
+        assert_eq!(second.message, "local file source is unchanged");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_file_ingest_changed_content_keeps_previous_hash() {
+        let root = unique_temp_dir("wiki-craft-local-file-changed-test");
+        fs::create_dir_all(&root).expect("test root");
+        let source_path = root.join("notes.txt");
+        fs::write(&source_path, "first version").expect("source file");
+        let cfg = active_kb_config(&root);
+        let paths = WorkspacePaths::from_config(&cfg);
+        let mut generator = FakeGenerator::new();
+
+        let first =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect("first local file ingest");
+        let first_hash = first.changed_sources[0].new_hash.clone();
+        let unchanged =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect("unchanged local file ingest");
+        assert!(matches!(unchanged.kind, IngestOutcomeKind::Unchanged));
+        fs::write(&source_path, "second version").expect("source file changed");
+
+        let changed =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect("changed local file ingest");
+
+        assert!(matches!(changed.kind, IngestOutcomeKind::CandidateCreated));
+        assert_eq!(
+            changed.changed_sources[0].previous_hash.as_deref(),
+            Some(first_hash.as_str())
+        );
+        assert_ne!(changed.changed_sources[0].new_hash, first_hash);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_file_ingest_error_does_not_create_candidate() {
+        let root = unique_temp_dir("wiki-craft-local-file-error-test");
+        fs::create_dir_all(&root).expect("test root");
+        let source_path = root.join("notes.bin");
+        fs::write(&source_path, "not allowed").expect("source file");
+        let cfg = active_kb_config(&root);
+        let paths = WorkspacePaths::from_config(&cfg);
+        let mut generator = FakeGenerator::new();
+
+        let error =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect_err("unsupported local file");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported local source file extension")
+        );
+        assert!(list_candidates(&paths).expect("candidate list").is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_file_ingest_uses_loaded_active_knowledge_base_only() {
+        let root = unique_temp_dir("wiki-craft-local-file-active-kb-test");
+        fs::create_dir_all(&root).expect("test root");
+        let workspace_root = root.join(".wiki_craft");
+        let alpha_root = workspace_root.join("knowledge_bases").join("alpha");
+        let beta_root = workspace_root.join("knowledge_bases").join("beta");
+        fs::create_dir_all(&alpha_root).expect("alpha root");
+        fs::create_dir_all(&beta_root).expect("beta root");
+        let config_path = root.join("wiki_craft.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[runtime]\nroot = \"{}\"\nmax_steps = 4\n",
+                workspace_root.display()
+            ),
+        )
+        .expect("config");
+        write_kb_file(&alpha_root, "Alpha", "Alpha focus");
+        write_kb_file(&beta_root, "Beta", "Beta focus");
+        KnowledgeBaseRegistry {
+            schema_version: 1,
+            active_id: Some("alpha".to_string()),
+            knowledge_bases: vec![
+                KnowledgeBaseRecord {
+                    id: "alpha".to_string(),
+                    name: "Alpha".to_string(),
+                    focus: "Alpha focus".to_string(),
+                    root: alpha_root.display().to_string(),
+                    created_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                },
+                KnowledgeBaseRecord {
+                    id: "beta".to_string(),
+                    name: "Beta".to_string(),
+                    focus: "Beta focus".to_string(),
+                    root: beta_root.display().to_string(),
+                    created_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                },
+            ],
+        }
+        .save(
+            &workspace_root
+                .join(KNOWLEDGE_BASES_DIR)
+                .join(KNOWLEDGE_BASE_REGISTRY_FILE),
+        )
+        .expect("registry");
+        let source_path = root.join("notes.md");
+        fs::write(&source_path, "# Alpha only").expect("source file");
+        let cfg = AppConfig::load(&config_path).expect("active config");
+        let paths = WorkspacePaths::from_config(&cfg);
+        let mut generator = FakeGenerator::new();
+
+        let outcome =
+            run_ingest_local_file_with_generator(&cfg, &paths, &source_path, &mut generator)
+                .expect("local file ingest");
+
+        assert!(matches!(outcome.kind, IngestOutcomeKind::CandidateCreated));
+        assert!(
+            alpha_root
+                .join("knowledge")
+                .join("staging")
+                .join("candidates")
+                .exists()
+        );
+        assert!(
+            !beta_root
+                .join("knowledge")
+                .join("staging")
+                .join("candidates")
+                .exists()
+        );
+        assert!(
+            alpha_root
+                .join("knowledge")
+                .join("approved")
+                .join("evidence")
+                .join("sources")
+                .join("manifest.json")
+                .exists()
+        );
+        assert!(
+            !beta_root
+                .join("knowledge")
+                .join("approved")
+                .join("evidence")
+                .join("sources")
+                .join("manifest.json")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1819,6 +2097,32 @@ mod tests {
             ingest: IngestConfig::default(),
         }
         .save(&workspace_root.join(KNOWLEDGE_BASE_CONFIG_FILE))
+        .expect("knowledge base config");
+    }
+
+    fn active_kb_config(root: &Path) -> AppConfig {
+        AppConfig {
+            knowledge_base: Some(ActiveKnowledgeBase {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                focus: "Test focus".to_string(),
+                root: root.to_string_lossy().to_string(),
+            }),
+            runtime: crate::config::RuntimeConfig {
+                root: root.to_string_lossy().to_string(),
+                max_steps: 4,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn write_kb_file(root: &Path, name: &str, focus: &str) {
+        KnowledgeBaseFileConfig {
+            name: name.to_string(),
+            focus: focus.to_string(),
+            ingest: IngestConfig::default(),
+        }
+        .save(&root.join(KNOWLEDGE_BASE_CONFIG_FILE))
         .expect("knowledge base config");
     }
 

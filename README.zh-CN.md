@@ -72,6 +72,7 @@ Wiki Craft 也提供一个本地 Tauri 桌面 GUI，用来 review staged candida
 
 - 在侧边栏新建知识库，并填写必需的关注点。
 - 在侧边栏切换当前知识库。Review、Search、Ingest 和 candidate 操作都只作用于当前知识库。
+- 在当前知识库面板点击 `Import File`，选择本地 UTF-8 文本文件，并把它作为当前知识库的 source evidence 暂存。本地文件导入仍然要经过 summary approval 和 diff merge，才会进入正式知识。
 - 在知识库面板点击 `Create Skill`，可以为当前知识库生成 Codex/Claude 兼容的 `SKILL.md`。
 - `summaries_staged`：先查看变化 source summaries，再批准 summaries，生成候选知识 diff。
 - `diff_ready`：查看带颜色的 `diff.md`，确认后再 merge 到正式知识库。
@@ -236,6 +237,8 @@ max_bytes = 200000
 `cargo run -- ingest --once` 只抓取启用的 `ingest.once.sources`。`cargo run -- serve` 只抓取启用且已到各自 `interval_hours` 周期的 `ingest.cron.sources`。每个来源只需要 `url`；如果省略 `interval_hours`，默认是 24 小时。
 
 ingest 只作用于当前知识库。可以通过 `cargo run -- knowledge-base activate <id>` 或 GUI 选择器切换。
+
+本地文件导入和配置 URL 来源是分开的。桌面 GUI 的 `Import File` 会把用户选择的 UTF-8 文本文件作为当前知识库的一次性临时来源读取；它不会把文件写入 `knowledge_base.toml`，也不会把原始文件全文复制进 `.wiki_craft`。
 
 ### 抓取
 

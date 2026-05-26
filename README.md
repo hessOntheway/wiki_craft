@@ -72,6 +72,7 @@ Wiki Craft also includes a local Tauri desktop GUI for reviewing staged candidat
 
 - Create a knowledge base from the sidebar, including the required focus statement.
 - Switch the active knowledge base from the sidebar. Review, search, ingest, and candidate actions operate on the active knowledge base only.
+- Use `Import File` in the active knowledge-base panel to pick a local UTF-8 text file and stage it as source evidence for the current knowledge base only. Local file imports still require the normal summary approval and diff merge steps before they become approved knowledge.
 - Use `Create Skill` in the knowledge-base panel to generate a Codex/Claude-compatible `SKILL.md` for the selected knowledge base.
 - `summaries_staged`: review changed source summaries, then approve summaries to generate a candidate knowledge diff.
 - `diff_ready`: review the colorized `diff.md`, then merge the accepted diff into approved knowledge.
@@ -236,6 +237,8 @@ max_bytes = 200000
 `cargo run -- ingest --once` fetches only enabled `ingest.once.sources`. `cargo run -- serve` fetches only enabled `ingest.cron.sources` whose per-source `interval_hours` is due. Each source only needs a `url`; if `interval_hours` is omitted, it defaults to 24 hours.
 
 Only the active knowledge base is ingested. Use `cargo run -- knowledge-base activate <id>` or the GUI selector to switch.
+
+Local file import is separate from configured URL sources. In the desktop GUI, `Import File` reads a selected UTF-8 text file as a temporary source for the active knowledge base; it does not add the file to `knowledge_base.toml`, and it does not copy raw file contents into `.wiki_craft`.
 
 ### Fetching
 

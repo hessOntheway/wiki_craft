@@ -33,6 +33,13 @@ fn log_gui_event(level: String, message: String, context: Option<Value>) -> Resu
     })
 }
 
+#[tauri::command]
+fn ingest_local_file(path: String) -> Result<wiki_craft::runtime::IngestOutcome, String> {
+    let config_path = wiki_craft::web::config_path_from_env();
+    wiki_craft::runtime::run_production_ingest_local_file(&config_path, Path::new(&path))
+        .map_err(|error| format!("{error:#}"))
+}
+
 fn start_backend() -> anyhow::Result<String> {
     dotenvy::dotenv().ok();
 
@@ -67,7 +74,10 @@ fn start_backend() -> anyhow::Result<String> {
     let api_base_url = format!("http://{addr}");
 
     thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
             Ok(runtime) => runtime,
             Err(error) => {
                 eprintln!("error: failed to build desktop web runtime: {error}");
@@ -93,8 +103,12 @@ fn start_backend() -> anyhow::Result<String> {
 }
 
 fn gui_log_path_for_config(config_path: &Path) -> anyhow::Result<PathBuf> {
-    let config = AppConfig::load_or_default(config_path)
-        .with_context(|| format!("failed to load config for GUI log path: {}", config_path.display()))?;
+    let config = AppConfig::load_or_default(config_path).with_context(|| {
+        format!(
+            "failed to load config for GUI log path: {}",
+            config_path.display()
+        )
+    })?;
     let paths = WorkspacePaths::from_config(&config);
     Ok(paths.root.join("runtime").join("gui").join("events.jsonl"))
 }
@@ -133,6 +147,7 @@ fn unix_ms() -> u128 {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|_app| {
             let api_base_url = start_backend().map_err(|error| {
                 eprintln!("error: failed to start desktop backend: {error:#}");
@@ -141,7 +156,11 @@ fn main() {
             let _ = API_BASE_URL.set(api_base_url);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_api_base_url, log_gui_event])
+        .invoke_handler(tauri::generate_handler![
+            get_api_base_url,
+            log_gui_event,
+            ingest_local_file
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Wiki Craft desktop app");
 }

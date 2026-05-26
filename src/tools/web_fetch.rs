@@ -135,7 +135,7 @@ pub fn normalize_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn decode_response_text(raw: &str, content_type: Option<&str>) -> String {
+pub fn decode_response_text(raw: &str, content_type: Option<&str>) -> String {
     if content_type
         .map(|value| value.contains("html") || value.contains("xhtml"))
         .unwrap_or(false)

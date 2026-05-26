@@ -6,6 +6,7 @@ import {
   Database,
   FileDiff,
   FileText,
+  FileUp,
   GitMerge,
   LoaderCircle,
   Plus,
@@ -98,6 +99,14 @@ interface StatusSnapshot {
   } | null;
 }
 
+interface IngestOutcome {
+  kind: "no_sources" | "no_due_sources" | "unchanged" | "candidate_created";
+  run_id?: string | null;
+  changed_sources: ChangedSource[];
+  checked_sources: number;
+  message: string;
+}
+
 interface ActionOutcome {
   run_id: string;
   status?: CandidateStatus;
@@ -184,6 +193,7 @@ export function App() {
   const [skillCreating, setSkillCreating] = useState(false);
   const [skillMessage, setSkillMessage] = useState("");
   const [skillError, setSkillError] = useState("");
+  const [localFileImporting, setLocalFileImporting] = useState(false);
 
   const apiUrl = useCallback(
     (path: string) => (apiBaseUrl ? `${apiBaseUrl}${path}` : path),
@@ -420,6 +430,57 @@ export function App() {
     }
   };
 
+  const importLocalFile = async () => {
+    if (!activeKnowledgeBase || localFileImporting || !window.__TAURI_INTERNALS__) {
+      return;
+    }
+    setPageMode("review");
+    setLastError("");
+    setLastMessage("");
+    setLocalFileImporting(true);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const { invoke } = await import("@tauri-apps/api/core");
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        filters: [
+          {
+            name: "Text sources",
+            extensions: ["md", "markdown", "txt", "html", "htm", "json", "csv", "tsv", "toml", "yaml", "yml"],
+          },
+        ],
+      });
+      if (!selected || Array.isArray(selected)) {
+        return;
+      }
+      await logGuiEvent("info", "local_file_import_started", {
+        knowledgeBaseId: activeKnowledgeBase.id,
+        path: selected,
+      });
+      const outcome = await invoke<IngestOutcome>("ingest_local_file", { path: selected });
+      setLastMessage(outcome.message);
+      await refresh(outcome.run_id || selectedRunId);
+      if (outcome.run_id) {
+        setActiveTab("summaries");
+      }
+      await logGuiEvent("info", "local_file_import_completed", {
+        knowledgeBaseId: activeKnowledgeBase.id,
+        runId: outcome.run_id || null,
+        message: outcome.message,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      void logGuiEvent("error", "local_file_import_failed", {
+        knowledgeBaseId: activeKnowledgeBase.id,
+        error: message,
+      });
+      setLastError(message);
+    } finally {
+      setLocalFileImporting(false);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     async function boot() {
@@ -611,6 +672,7 @@ export function App() {
   const canApprove = Boolean(detail?.actions.approve_summaries);
   const canMerge = Boolean(detail?.actions.merge_diff);
   const canReject = Boolean(detail?.actions.reject);
+  const isTauriRuntime = Boolean(window.__TAURI_INTERNALS__);
 
   return (
     <div className="app-shell">
@@ -729,6 +791,12 @@ export function App() {
                 Create
               </button>
             </form>
+          )}
+          {activeKnowledgeBase && isTauriRuntime && (
+            <button className="secondary-button" type="button" onClick={() => void importLocalFile()} disabled={localFileImporting}>
+              {localFileImporting ? <LoaderCircle className="spin" size={17} /> : <FileUp size={17} />}
+              Import File
+            </button>
           )}
           {activeKnowledgeBase && (
             <div className="skill-panel">

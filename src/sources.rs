@@ -3,14 +3,16 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::SourceConfig;
 use crate::tools::WebFetchOutput;
+use crate::tools::web_fetch::{decode_response_text, normalize_whitespace};
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const LOCAL_FILE_MAX_BYTES: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SourceManifest {
@@ -283,6 +285,88 @@ pub fn fetched_from_output(config: &SourceConfig, output: WebFetchOutput) -> Fet
     }
 }
 
+pub fn fetched_from_local_file(path: &Path) -> Result<FetchedSource> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve local source file: {}", path.display()))?;
+    let metadata = fs::metadata(&canonical).with_context(|| {
+        format!(
+            "failed to read local source metadata: {}",
+            canonical.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!("local source must be a file: {}", canonical.display());
+    }
+    if metadata.len() > LOCAL_FILE_MAX_BYTES {
+        bail!(
+            "local source file is too large: {} bytes (max {})",
+            metadata.len(),
+            LOCAL_FILE_MAX_BYTES
+        );
+    }
+
+    let extension = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !is_supported_local_text_extension(&extension) {
+        bail!(
+            "unsupported local source file extension: {}; supported extensions are {}",
+            if extension.is_empty() {
+                "<none>"
+            } else {
+                extension.as_str()
+            },
+            supported_local_text_extensions().join(", ")
+        );
+    }
+
+    let bytes = fs::read(&canonical)
+        .with_context(|| format!("failed to read local source file: {}", canonical.display()))?;
+    if bytes.is_empty() {
+        bail!("local source file is empty: {}", canonical.display());
+    }
+    let raw_text = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "local source file is not valid UTF-8: {}",
+            canonical.display()
+        )
+    })?;
+    let text = if matches!(extension.as_str(), "html" | "htm") {
+        decode_response_text(&raw_text, Some("text/html"))
+    } else {
+        normalize_whitespace(&raw_text)
+    };
+    let normalized_text = normalize_source_text(&text);
+    if normalized_text.trim().is_empty() {
+        bail!(
+            "local source file has no readable text after normalization: {}",
+            canonical.display()
+        );
+    }
+
+    let file_uri = file_uri_for_path(&canonical)?;
+    let content_hash = sha256_hex(&normalized_text);
+    let title = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
+
+    Ok(FetchedSource {
+        source_id: source_id_for_url(&file_uri),
+        url: file_uri.clone(),
+        final_url: file_uri,
+        title,
+        etag: None,
+        last_modified: None,
+        normalized_text,
+        content_hash: content_hash.clone(),
+        version_key: content_hash,
+    })
+}
+
 pub fn normalize_source_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -306,6 +390,27 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+fn file_uri_for_path(path: &Path) -> Result<String> {
+    reqwest::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "failed to convert local path to file URI: {}",
+                path.display()
+            )
+        })
+}
+
+fn is_supported_local_text_extension(extension: &str) -> bool {
+    supported_local_text_extensions().contains(&extension)
+}
+
+fn supported_local_text_extensions() -> &'static [&'static str] {
+    &[
+        "md", "markdown", "txt", "html", "htm", "json", "csv", "tsv", "toml", "yaml", "yml",
+    ]
 }
 
 #[cfg(test)]
@@ -340,5 +445,70 @@ mod tests {
         assert!(manifest.is_changed(&fetched));
         manifest.upsert_fetched(&fetched, Some("run"), None);
         assert!(!manifest.is_changed(&fetched));
+    }
+
+    #[test]
+    fn local_file_source_uses_file_uri_and_hashes_text() {
+        let root = unique_temp_dir("wiki-craft-local-source-test");
+        fs::create_dir_all(&root).expect("test root");
+        let path = root.join("notes.md");
+        fs::write(&path, "# Notes\n\nhello\nworld").expect("source file");
+
+        let fetched = fetched_from_local_file(&path).expect("local source");
+
+        assert!(fetched.url.starts_with("file://"));
+        assert_eq!(fetched.url, fetched.final_url);
+        assert_eq!(fetched.source_id, source_id_for_url(&fetched.url));
+        assert_eq!(fetched.title.as_deref(), Some("notes.md"));
+        assert_eq!(fetched.normalized_text, "# Notes hello world");
+        assert_eq!(fetched.content_hash, sha256_hex("# Notes hello world"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_file_source_rejects_unsupported_extension() {
+        let root = unique_temp_dir("wiki-craft-local-source-extension-test");
+        fs::create_dir_all(&root).expect("test root");
+        let path = root.join("notes.bin");
+        fs::write(&path, "hello").expect("source file");
+
+        let error = fetched_from_local_file(&path).expect_err("unsupported extension");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported local source file extension")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_file_source_rejects_non_utf8() {
+        let root = unique_temp_dir("wiki-craft-local-source-utf8-test");
+        fs::create_dir_all(&root).expect("test root");
+        let path = root.join("notes.txt");
+        fs::write(&path, [0xff, 0xfe]).expect("source file");
+
+        let error = fetched_from_local_file(&path).expect_err("non-utf8 source");
+
+        assert!(error.to_string().contains("not valid UTF-8"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_file_source_rejects_empty_text() {
+        let root = unique_temp_dir("wiki-craft-local-source-empty-test");
+        fs::create_dir_all(&root).expect("test root");
+        let path = root.join("notes.txt");
+        fs::write(&path, " \n\t ").expect("source file");
+
+        let error = fetched_from_local_file(&path).expect_err("empty source");
+
+        assert!(error.to_string().contains("no readable text"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{}-{}", prefix, now_unix_ms()))
     }
 }
